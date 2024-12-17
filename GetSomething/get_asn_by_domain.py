@@ -5,7 +5,7 @@ import socket
 from ipwhois import IPWhois
 
 def get_asn(domain):
-    """Получает ASN для заданного домена."""
+    """Retrieves the ASN for a given domain."""
     try:
         ip_address = socket.gethostbyname(domain)
         obj = IPWhois(ip_address)
@@ -16,7 +16,7 @@ def get_asn(domain):
         return None
 
 def process_domains(domains, output_file=None):
-    """Обрабатывает список доменов и выводит результаты."""
+    """Processes a list of domains and outputs the results."""
     results = []
     for domain in domains:
         asn = get_asn(domain)
@@ -32,7 +32,7 @@ def process_domains(domains, output_file=None):
                 f_out.write(result + '\n')
 
 def main(input_file=None, output_file=None, domain_list=None):
-    """Основная функция обработки доменов."""
+    """Main function for domain processing."""
     if domain_list:
         domains = domain_list
     elif input_file:
@@ -45,10 +45,10 @@ def main(input_file=None, output_file=None, domain_list=None):
         print("No domains to process.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Получение ASN для списка доменов.")
-    parser.add_argument('-i', '--input', help='Файл с доменами.')
-    parser.add_argument('-o', '--output', help='Файл для записи результатов. Если не указан, используется вывод в консоль.')
-    parser.add_argument('-d', '--domains', nargs='+', help='Один или несколько доменов для обработки.')
+    parser = argparse.ArgumentParser(description="Retrieves ASN for a list of domains.")
+    parser.add_argument('-i', '--input', help='File with domains.')
+    parser.add_argument('-o', '--output', help='File to write results. If not specified, the console is used.')
+    parser.add_argument('-d', '--domains', nargs='+', help='One or more domains to process.')
     
     args = parser.parse_args()
     
