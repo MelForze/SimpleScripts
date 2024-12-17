@@ -64,7 +64,7 @@ def main(input_list, output_file=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Get unique subnets from a list of IP addresses.')
-    parser.add_argument('-i', '--input_list', required=True, help='Input file with list of IP addresses')
+    parser.add_argument('-i', '--input', required=True, help='Input file with list of IP addresses')
     parser.add_argument('-o', '--output', help='(Optional) Output file to save unique subnets. If not specified, results are printed to the console.')
 
     args = parser.parse_args()
