@@ -3,7 +3,7 @@
 <h2>Simple Scripts</h2>
 </div>
 
-'''
+```
 import sys
 import argparse
 import itertools
@@ -79,4 +79,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
+```
