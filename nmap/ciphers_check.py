@@ -15,7 +15,7 @@ def read_domains(file_path):
     with open(file_path, 'r', encoding='utf-8') as file:
         domains = [line.strip() for line in file if line.strip()]
     if not domains:
-        raise ValueError("The domain list is empty.")
+        raise ValueError("The domain list is empty!")
     return domains
 
 def execute_nmap(domains, output_path):
