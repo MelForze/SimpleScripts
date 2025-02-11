@@ -7,9 +7,11 @@ import argparse
 import requests
 from dataclasses import dataclass, field
 from typing import List, Set
+from rich.console import Console
 
 DEBUG = False
 NUMBERING = False
+console = Console()
 
 @dataclass
 class HostCipherInfo:
@@ -18,15 +20,17 @@ class HostCipherInfo:
     tls_versions: Set[str] = field(default_factory=set)
 
 def print_banner() -> None:
-    banner = r"""
-   _______       __                   __  __            __           
-  / ____(_)___  / /_  ___  __________/ / / /_  ______  / /____  _____
- / /   / / __ \/ __ \/ _ \/ ___/ ___/ /_/ / / / / __ \/ __/ _ \/ ___/
-/ /___/ / /_/ / / / /  __/ /  (__  ) __  / /_/ / / / / /_/  __/ /    
-\____/_/ .___/_/ /_/\___/_/  /____/_/ /_/\__,_/_/ /_/\__/\___/_/     
-      /_/                                                            
-    """
-    print(banner)
+    banner = (
+        "[red]   _______       __                   __  __            __           [/red]\n"
+        "[blue]  / ____(_)___  / /_  ___  __________/ / / /_  ______  / /____  _____[/blue]\n"
+        "[red] / /   / / __ \\/ __ \\/ _ \\/ ___/ ___/ /_/ / / / / __ \\/ __/ _ \\/ ___/[/red]\n"
+        "[blue]/ /___/ / /_/ / / / /  __/ /  (__  ) __  / /_/ / / / / /_/  __/ /    [/blue]\n"
+        "[red]\\____/_/ .___/_/ /_/\\___/_/  /____/_/ /_/\\__,_/_/ /_/\\__/\\___/_/     [/red]\n"
+        "[blue]      /_/                                                            [/blue]"
+    )
+    console.print(banner, markup=True)
+    description="Scans domains for SSL/TLS cipher security using nmap and the ciphersuite.info API. Provide a domain list file (-d) or an nmap XML report (-x).\n"
+    console.print(description, style="bold white")
 
 def read_domains(file_path: str) -> List[str]:
     if not os.path.isfile(file_path):
@@ -173,9 +177,7 @@ def check_ciphers_with_api(hosts_info: List[HostCipherInfo]) -> None:
 
 def main() -> None:
     print_banner()
-    parser = argparse.ArgumentParser(
-        description="Scans domains for SSL/TLS cipher security using nmap and the ciphersuite.info API. Provide a domain list file (-d) or an nmap XML report (-x)."
-    )
+    parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-d", "--domains", type=str, help="File containing a list of domains (one per line).")
     group.add_argument("-x", "--xml", type=str, help="nmap XML report file.")
