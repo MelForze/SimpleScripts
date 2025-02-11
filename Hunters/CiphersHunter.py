@@ -26,7 +26,7 @@ def print_banner() -> None:
         "[red] / /   / / __ \\/ __ \\/ _ \\/ ___/ ___/ /_/ / / / / __ \\/ __/ _ \\/ ___/[/red]\n"
         "[blue]/ /___/ / /_/ / / / /  __/ /  (__  ) __  / /_/ / / / / /_/  __/ /    [/blue]\n"
         "[red]\\____/_/ .___/_/ /_/\\___/_/  /____/_/ /_/\\__,_/_/ /_/\\__/\\___/_/     [/red]\n"
-        "[blue]      /_/                                                            [/blue]"
+        "[blue]      /_/                                                            [/blue]\n"
     )
     console.print(banner, markup=True)
     description="Scans domains for SSL/TLS cipher security using nmap and the ciphersuite.info API. Provide a domain list file (-d) or an nmap XML report (-x).\n"

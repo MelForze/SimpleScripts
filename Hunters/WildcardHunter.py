@@ -21,7 +21,7 @@ def print_banner():
         "[blue]                                                                     [/blue]"
     )
     console.print(banner, markup=True)
-    console.print("This script compares SSL certificate fingerprints and detects certificate reuse between domains. Optionally, results can be written to an output file.", style="bold white")
+    console.print("This script compares SSL certificate fingerprints and detects certificate reuse between domains. Optionally, results can be written to an output file.\n", style="bold white")
 
 class BannerHelpAction(argparse._HelpAction):
     def __call__(self, parser, namespace, values, option_string=None):
