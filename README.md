@@ -10,10 +10,29 @@ This repository consists of scripts that can make life easier for both me and yo
 ## To Do
 
 - [x] **Create Wildcard Hunter Script**  
-   Develop a script to search for wildcard certificates, streamlining the process of certificate discovery and verification.
+  Develop a script to search for wildcard certificates, streamlining the process of certificate discovery and verification.
 
 - [ ] **Create Linpeas/Winpeas Everywhere Script**  
-   Build a script that deploys Linpeas on multiple systems to streamline system auditing and security checks.
+  Build a script that deploys Linpeas on multiple systems to streamline system auditing and security checks.
+
+- [ ] **Ansible OSINT script**
+  Develop a script that will automate the entire OSINT process including:
+  - [ ] Shodan
+  - [ ] Censys
+  - [ ] Bbot
+  - [ ] Puredns
+  - [ ] Katana
+  - [ ] Ffuf - Vhosts
+  - [ ] Ffuf/Feroxbuster - Folders
+  - [ ] Wildcard
+  - [ ] SSL Ciphers
+  - [ ] Nmap/Masscan
+  - [ ] Nuclei
+  - [ ] Httpx
+  - [ ] Metaforge
+  - [ ] Anything else?
 
 - [ ] **Implement Additional Utility Scripts**  
-   Explore and integrate further tools and enhancements to expand the functionality of this project.
+  Explore and integrate further tools and enhancements to expand the functionality of this project.
+
+  
