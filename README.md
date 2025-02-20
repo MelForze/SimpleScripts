@@ -9,11 +9,11 @@ This repository consists of scripts that can make life easier for both me and yo
 
 ## To Do
 
-1. **Create Wildcard Hunter Script**  
+[x] **Create Wildcard Hunter Script**  
    Develop a script to search for wildcard certificates, streamlining the process of certificate discovery and verification.
 
-2. **Create Linpeas Everywhere Script**  
+[ ] **Create Linpeas/Winpeas Everywhere Script**  
    Build a script that deploys Linpeas on multiple systems to streamline system auditing and security checks.
 
-3. **Implement Additional Utility Scripts**  
+[ ] **Implement Additional Utility Scripts**  
    Explore and integrate further tools and enhancements to expand the functionality of this project.
