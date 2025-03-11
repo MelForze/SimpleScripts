@@ -27,18 +27,7 @@ def print_banner() -> None:
     console.print("\n" + description, style="bold white")
 
 def process_input(lines):
-    """
-    Processes lines in the format:
-      domain\\username:nthash:password
-    or
-      username:nthash:password
 
-    Counts the number of accounts with a password (even if empty)
-    and returns:
-      - total number of accounts,
-      - a counter of passwords,
-      - a list of compromised entries as tuples (username, password).
-    """
     total_accounts = 0
     password_counter = Counter()
     compromised_entries = []
@@ -47,20 +36,18 @@ def process_input(lines):
         line = line.rstrip("\n")
         if not line:
             continue
-        # Split the line into 3 parts: login, nthash, and password.
+        
         parts = line.split(":", 2)
         if len(parts) != 3:
             continue
         
         login = parts[0]
-        # Extract username: if login contains a backslash, take the part after it.
         if "\\" in login:
             username = login.split("\\")[-1]
         else:
             username = login
         
         password = parts[2]
-        # Normalize empty password (after stripping whitespace)
         if password.strip() == "":
             password = ""
         
@@ -95,10 +82,9 @@ def main():
     )
     parser.add_argument("-h", "--help", action="store_true", help="Show this help message and exit")
     
-    # If no arguments are provided, print help and exit.
     if len(sys.argv) == 1:
         print_banner()
-        console.print("")  # empty line between description and usage
+        console.print("")
         parser.print_help()
         sys.exit(0)
     
@@ -106,14 +92,13 @@ def main():
     
     if args.help:
         print_banner()
-        console.print("")  # empty line between description and usage
+        console.print("")
         parser.print_help()
         sys.exit(0)
     
     print_banner()
-    console.print("")  # empty line after banner
+    console.print("")
     
-    # Read input lines from the file if provided, else from standard input.
     if args.file:
         try:
             with open(args.file, 'r', encoding='utf-8') as f:
@@ -126,13 +111,12 @@ def main():
     
     total_accounts, password_counter, compromised_entries = process_input(lines)
     
-    # Determine effective top value (cannot exceed available distinct passwords)
     effective_top = min(args.top, len(password_counter))
     
     console.print("\n" + "=" * 60 + "\n", style="bold white")
     console.print("Cracked passwords count: " + str(total_accounts), style="bold green")
     console.print("\nTop {} most frequent passwords:".format(effective_top), style="bold green")
-    console.print("")  # empty line before table
+    console.print("")
     
     table = Table(show_header=True, header_style="bold", show_edge=True)
     table.add_column("Password", no_wrap=True)
@@ -143,12 +127,10 @@ def main():
         table.add_row(display_pass, str(count))
     
     console.print(table)
-    console.print("")  # empty line after table
+    console.print("")
     
-    # If save flag is set, write compromised usernames and user:password pairs to files.
     if args.save:
         try:
-            # Save unique compromised usernames to compromised.txt
             with open("compromised.txt", "w", encoding="utf-8") as f:
                 seen = set()
                 for username, _ in compromised_entries:
@@ -156,7 +138,6 @@ def main():
                         f.write(username + "\n")
                         seen.add(username)
             
-            # Save user:password pairs to user-pass.txt
             with open("user-pass.txt", "w", encoding="utf-8") as f:
                 for username, password in compromised_entries:
                     f.write(f"{username}:{password}\n")
