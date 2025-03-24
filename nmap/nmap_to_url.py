@@ -64,9 +64,9 @@ def build_url(target, port_element):
     # Установка URL с учетом порта
     default_port = '443' if protocol == 'https' else '80'
     if portid == default_port:
-        url = f"{protocol}://{target}"
+        url = f"{protocol}://{target}/"
     else:
-        url = f"{protocol}://{target}:{portid}"
+        url = f"{protocol}://{target}:{portid}/"
 
     return url
 
