@@ -321,7 +321,7 @@ def check_ciphers_with_api(hosts_info: List[HostCipherInfo], update: bool) -> No
 def main() -> None:
     print_banner()
     parser = argparse.ArgumentParser()
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("-d", "--domains", type=str, help="File containing a list of domains/subnets/IPs (one per line).")
     group.add_argument("-x", "--xml", type=str, help="nmap XML report file.")
     parser.add_argument("-p", "--ports", type=str, default="443", help="Ports to scan (comma-separated or '-' for all ports).")
@@ -330,9 +330,20 @@ def main() -> None:
     parser.add_argument("-s", "--save", type=str, help="Save final report output to file.")
     parser.add_argument("-up", "--update", action="store_true", help="Update cipher cache from API")
     args = parser.parse_args()
+
+    if not (args.domains or args.xml or args.update):
+        parser.error("No input provided. Please specify a domain list (-d) or nmap XML file (-x), or use -up to update the cipher cache.")
+
     global DEBUG, NUMBERING
     DEBUG = args.debug
     NUMBERING = args.number
+    
+    if args.update:
+        get_security_sets(update=True)
+        if not (args.domains or args.xml):
+            log("[*] Cipher cache updated successfully. Exiting.", style="green", highlight=False)
+            sys.exit(0)
+    
     try:
         if args.xml:
             log("[*] Using provided nmap XML report.", highlight=False)
