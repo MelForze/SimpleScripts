@@ -86,7 +86,7 @@ def read_domains(file_path: str) -> List[str]:
 def execute_nmap(domains: List[str], output_path: str, ports: str) -> None:
     log("[*] Running nmap on the following targets:", highlight=False)
     log("    " + ", ".join(domains), highlight=False)
-    nmap_command = ["nmap", "-sV", "--script", "ssl-enum-ciphers,ssl-cert", "-p", ports, "-oX", output_path] + domains
+    nmap_command = ["nmap","-Pn", "-sV", "--script", "ssl-enum-ciphers,ssl-cert", "-p", ports, "-oX", output_path] + domains
     result = subprocess.run(nmap_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if result.returncode != 0:
         log(f"[!] Warning: nmap exited with code {result.returncode}. Error: {result.stderr.decode().strip()}", style="red", highlight=False)
