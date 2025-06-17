@@ -36,39 +36,39 @@ def sanitize_filename(url: str) -> str:
                .replace('/', '_'))
 
 def run_katana(url: str, out_dir: Path, extra_opts: list[str]) -> None:
-    """
-    Run katana for the given URL, sort and dedupe results, and handle output.
-    """
-    safe_name = sanitize_filename(url)
-    temp_file = out_dir / f"{safe_name}_active.txt"
-    final_file = out_dir / f"{safe_name}_Katana.txt"
+    safe = sanitize_filename(url)
+    temp_file = out_dir / f"{safe}_active.txt"
+    sorted_file = out_dir / f"{safe}_sorted.txt"
+    final_file = out_dir / f"{safe}_Katana.txt"
 
-    print(f"[+] {out_dir.name}: processing {url} → {final_file.name}")
+    print(f"[+] {out_dir.name}: processing {url}")
 
-    # Prepare command
     cmd = ['katana', '-u', url] + KATANA_BASE_OPTS.copy()
     cmd[cmd.index('-crawl-scope') + 1] = url
     cmd += extra_opts
 
     try:
-        # Run katana and write to temporary file
         with temp_file.open('w') as tmpf:
             subprocess.run(cmd, stdout=tmpf, stderr=subprocess.DEVNULL, check=True)
 
-        # For "paths", write URL as first line, then append sorted results
+        # Sort and dedupe only katana output
+        subprocess.run(['sort', '-u', str(temp_file), '-o', str(sorted_file)], check=True)
+
+        # For paths: prepend URL before sorted content
         if out_dir.name == 'paths':
             with final_file.open('w') as outf:
                 outf.write(url + "\n")
-                subprocess.run(['sort', '-u', str(temp_file)], stdout=outf, check=True)
+                outf.write(sorted_file.read_text())
         else:
-            subprocess.run(['sort', '-u', str(temp_file), '-o', str(final_file)], check=True)
+            # Move sorted to final
+            sorted_file.rename(final_file)
 
     except subprocess.CalledProcessError as e:
         print(f"[!] Error processing {url} in {out_dir.name}: {e}")
     finally:
-        # Ensure temporary file is removed
-        if temp_file.exists():
-            temp_file.unlink()
+        for tmp in (temp_file, sorted_file):
+            if tmp.exists():
+                tmp.unlink()
 
 def main():
     """
