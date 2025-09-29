@@ -8,17 +8,48 @@ import logging
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 def resolve_target(host):
-    ip = None
+    """
+    Возвращает имя хоста (если есть), иначе IP-адрес.
+    При выборе IP учитывается addrtype: предпочитается ipv4, затем ipv6.
+    Если ipv4/ipv6 не найдены — возвращается любой addr.
+    """
+    ipv4_addrs = []
+    ipv6_addrs = []
+    other_addrs = []
     domain = None
+
+    # Собираем адреса по типу
     for address in host.findall('address'):
         addr = address.get('addr')
-        if addr:
-            ip = addr
+        atype = (address.get('addrtype') or '').lower()
+        if not addr:
+            continue
+        if atype == 'ipv4':
+            ipv4_addrs.append(addr)
+        elif atype == 'ipv6':
+            ipv6_addrs.append(addr)
+        else:
+            other_addrs.append(addr)
+
+    # Если есть hostname — используем его
     for hostname in host.findall('./hostnames/hostname'):
         name = hostname.get('name')
         if name:
             domain = name
-    return domain if domain else ip
+            break
+
+    if domain:
+        return domain
+
+    # Предпочтения: ipv4 -> ipv6 -> любой другой addr
+    if ipv4_addrs:
+        return ipv4_addrs[0]
+    if ipv6_addrs:
+        return ipv6_addrs[0]
+    if other_addrs:
+        return other_addrs[0]
+
+    return None
 
 def parse_nmap_xml(input_file, output_file, https_filter):
     input_file = os.path.abspath(input_file)
