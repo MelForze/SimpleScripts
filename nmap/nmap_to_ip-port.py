@@ -9,16 +9,16 @@ logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 def resolve_target(host):
     """
-    Возвращает имя хоста (если есть), иначе IP-адрес.
-    При выборе IP учитывается addrtype: предпочитается ipv4, затем ipv6.
-    Если ipv4/ipv6 не найдены — возвращается любой addr.
+    Return the hostname if present; otherwise return an IP address.
+    When selecting an IP, prefer addrtype in this order: ipv4, then ipv6.
+    If neither ipv4 nor ipv6 is found, return any available addr.
     """
     ipv4_addrs = []
     ipv6_addrs = []
     other_addrs = []
     domain = None
 
-    # Собираем адреса по типу
+    # Collect addresses by type
     for address in host.findall('address'):
         addr = address.get('addr')
         atype = (address.get('addrtype') or '').lower()
@@ -31,7 +31,7 @@ def resolve_target(host):
         else:
             other_addrs.append(addr)
 
-    # Если есть hostname — используем его
+    # Use hostname if available
     for hostname in host.findall('./hostnames/hostname'):
         name = hostname.get('name')
         if name:
@@ -41,7 +41,7 @@ def resolve_target(host):
     if domain:
         return domain
 
-    # Предпочтения: ipv4 -> ipv6 -> любой другой addr
+    # Preference order: ipv4 -> ipv6 -> any other addr
     if ipv4_addrs:
         return ipv4_addrs[0]
     if ipv6_addrs:
