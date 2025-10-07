@@ -294,7 +294,7 @@ def main():
     parser.add_argument('-h', '--help', action=BannerHelpAction, help="Show help and exit.")
     parser.add_argument('-s', '--scope', required=True, help="Path to scope file (.txt, .yaml, or .yml)")
     parser.add_argument('-out', '--outscope', required=True, help="Path to outscope file (.txt, .yaml, or .yml)")
-    parser.add_argument('-p', '--ports', help="Comma-separated list of ports to scan when ports are not specified in input files, e.g. '443,80,8443'")
+    parser.add_argument('-p', '--ports', help="Comma-separated list of ports to scan when ports are not specified in input files, e.g. '80,443,8443,8080'")
     parser.add_argument('-debug', action='store_true', help="Enable debug mode")
     parser.add_argument('-print', action='store_true', help="Print certificate fingerprint in output")
     parser.add_argument('-o', '--output', help="Path to output file for results")
