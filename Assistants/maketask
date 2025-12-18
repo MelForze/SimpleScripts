@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+#
+# create-pentest-project.sh
+# Simple pentest project directory generator
+#
+
+set -Eeuo pipefail
+
+# ---------- globals ----------
+SCRIPT_NAME="$(basename "$0")"
+
+# ---------- helpers ----------
+usage() {
+    cat <<EOF
+Usage:
+  $SCRIPT_NAME <project-name>
+
+Description:
+  Interactive script for creating a pentest project directory structure.
+  Asks minimal Y/N questions and creates folders accordingly.
+
+Options:
+  -h, --help      Show this help message and exit
+
+Example:
+  $SCRIPT_NAME ACME-Pentest-2025
+EOF
+}
+
+ask_yn() {
+    local prompt="$1"
+    local answer
+
+    while true; do
+        read -rp "$prompt (Y/N): " answer
+        case "$answer" in
+            [Yy]) return 0 ;;
+            [Nn]) return 1 ;;
+            *) echo "Please enter Y or N." ;;
+        esac
+    done
+}
+
+die() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+# ---------- args ----------
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+if [[ $# -ne 1 ]]; then
+    usage
+    exit 1
+fi
+
+PROJECT_NAME="$1"
+
+# ---------- main ----------
+echo "[*] Creating pentest project: $PROJECT_NAME"
+
+if [[ -e "$PROJECT_NAME" ]]; then
+    die "Directory '$PROJECT_NAME' already exists"
+fi
+
+mkdir -p "$PROJECT_NAME"
+cd "$PROJECT_NAME"
+
+# ---------- base ----------
+mkdir -p Report Screenshots
+
+# ---------- External ----------
+if ask_yn "Is there External pentesting scope?"; then
+    mkdir -p External/{bbot_active,bbot_passive,ffuf,httpx,katana,masscan,nessus,nmap,nuclei,subdomains}
+fi
+
+# ---------- Internal ----------
+if ask_yn "Is there Internal pentesting scope?"; then
+    mkdir -p Internal/{ffuf,httpx,katana,masscan,nessus,nmap,nuclei}
+
+    if ask_yn "Is this a Windows environment with Active Directory?"; then
+        mkdir -p Internal/{ad_office,ad_pci}
+    fi
+fi
+
+# ---------- Mobile ----------
+if ask_yn "Is there Mobile pentesting scope?"; then
+    mkdir -p Mobile/{Android,iOS}
+fi
+
+echo "[+] Project '$PROJECT_NAME' successfully created"
