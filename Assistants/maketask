@@ -6,18 +6,15 @@
 
 set -Eeuo pipefail
 
-# ---------- globals ----------
 SCRIPT_NAME="$(basename "$0")"
 
-# ---------- helpers ----------
 usage() {
-    cat <<EOF
+  cat <<EOF
 Usage:
   $SCRIPT_NAME <project-name>
 
 Description:
   Interactive script for creating a pentest project directory structure.
-  Asks minimal Y/N questions and creates folders accordingly.
 
 Options:
   -h, --help      Show this help message and exit
@@ -28,42 +25,66 @@ EOF
 }
 
 ask_yn() {
-    local prompt="$1"
-    local answer
-
-    while true; do
-        read -rp "$prompt (Y/N): " answer
-        case "$answer" in
-            [Yy]) return 0 ;;
-            [Nn]) return 1 ;;
-            *) echo "Please enter Y or N." ;;
-        esac
-    done
+  local prompt="$1"
+  local answer
+  while true; do
+    read -rp "$prompt (Y/N): " answer
+    case "$answer" in
+      [Yy]) return 0 ;;
+      [Nn]) return 1 ;;
+      *) echo "Please enter Y or N." ;;
+    esac
+  done
 }
 
 die() {
-    echo "Error: $1" >&2
-    exit 1
+  echo "Error: $1" >&2
+  exit 1
+}
+
+mk_scoped_dirs() {
+  # mk_scoped_dirs <prefix-or-empty> <dir1> <dir2> ...
+  local prefix="$1"
+  shift
+
+  if [[ -n "$prefix" ]]; then
+    mkdir -p "$prefix"
+    local d
+    for d in "$@"; do
+      mkdir -p "$prefix/$d"
+    done
+  else
+    mkdir -p "$@"
+  fi
 }
 
 # ---------- args ----------
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    usage
-    exit 0
+  usage
+  exit 0
 fi
 
 if [[ $# -ne 1 ]]; then
-    usage
-    exit 1
+  usage
+  exit 1
 fi
 
 PROJECT_NAME="$1"
 
-# ---------- main ----------
+# safety: avoid dangerous names
+if [[ -z "$PROJECT_NAME" || "$PROJECT_NAME" == "." || "$PROJECT_NAME" == ".." || "$PROJECT_NAME" == "/" || "$PROJECT_NAME" == *"/"* ]]; then
+  die "Invalid project name: '$PROJECT_NAME' (must be a simple folder name without slashes)"
+fi
+
 echo "[*] Creating pentest project: $PROJECT_NAME"
 
+# overwrite prompt
 if [[ -e "$PROJECT_NAME" ]]; then
+  if ask_yn "Directory '$PROJECT_NAME' already exists. Overwrite it?"; then
+    rm -rf -- "$PROJECT_NAME"
+  else
     die "Directory '$PROJECT_NAME' already exists"
+  fi
 fi
 
 mkdir -p "$PROJECT_NAME"
@@ -72,23 +93,49 @@ cd "$PROJECT_NAME"
 # ---------- base ----------
 mkdir -p Report Screenshots
 
-# ---------- External ----------
+# ---------- scope selection ----------
+HAS_EXTERNAL=false
+HAS_INTERNAL=false
+HAS_AD=false
+
 if ask_yn "Is there External pentesting scope?"; then
-    mkdir -p External/{bbot_active,bbot_passive,ffuf,httpx,katana,masscan,nessus,nmap,nuclei,subdomains}
+  HAS_EXTERNAL=true
 fi
 
-# ---------- Internal ----------
 if ask_yn "Is there Internal pentesting scope?"; then
-    mkdir -p Internal/{ffuf,httpx,katana,masscan,nessus,nmap,nuclei}
+  HAS_INTERNAL=true
+  if ask_yn "Is this a Windows environment with Active Directory?"; then
+    HAS_AD=true
+  fi
+fi
 
-    if ask_yn "Is this a Windows environment with Active Directory?"; then
-        mkdir -p Internal/{ad_office,ad_pci}
-    fi
+# Determine whether to create External/Internal wrapper dirs
+EXTERNAL_PREFIX=""
+INTERNAL_PREFIX=""
+if $HAS_EXTERNAL && $HAS_INTERNAL; then
+  EXTERNAL_PREFIX="External"
+  INTERNAL_PREFIX="Internal"
+fi
+
+# ---------- create dirs ----------
+if $HAS_EXTERNAL; then
+  external_dirs=(bbot_active bbot_passive ffuf httpx katana masscan nessus nmap nuclei subdomains)
+  mk_scoped_dirs "$EXTERNAL_PREFIX" "${external_dirs[@]}"
+fi
+
+if $HAS_INTERNAL; then
+  internal_dirs=(ffuf httpx katana masscan nessus nmap nuclei)
+  mk_scoped_dirs "$INTERNAL_PREFIX" "${internal_dirs[@]}"
+
+  if $HAS_AD; then
+    ad_dirs=(ad_office ad_pci)
+    mk_scoped_dirs "$INTERNAL_PREFIX" "${ad_dirs[@]}"
+  fi
 fi
 
 # ---------- Mobile ----------
 if ask_yn "Is there Mobile pentesting scope?"; then
-    mkdir -p Mobile/{Android,iOS}
+  mkdir -p Mobile/{Android,iOS}
 fi
 
 echo "[+] Project '$PROJECT_NAME' successfully created"
