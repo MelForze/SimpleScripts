@@ -57,7 +57,6 @@ SCRIPT_SPECS = [
     ("Scanners/nmap_to_ip-port.py", "nmap_to_ip-port.py"),
     ("Scanners/nmap_to_url.py", "nmap_to_url.py"),
     ("Assistants/maketask", "maketask"),
-    ("Assistants/maketask.py", "maketask.py"),
     ("Linux/pivot_access_init.sh", "pivot_access_init.sh"),
 ]
 SCRIPT_FILES = list(dict.fromkeys(source for source, _ in SCRIPT_SPECS))
