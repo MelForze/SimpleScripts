@@ -10,7 +10,13 @@ import ipaddress
 import json
 from dataclasses import dataclass, field
 from typing import List, Set
-from rich.console import Console
+
+try:
+    from rich.console import Console
+except ModuleNotFoundError:
+    class Console:  # type: ignore[no-redef]
+        def print(self, *args, **kwargs):
+            print(*args)
 
 DEBUG = False
 NUMBERING = False
@@ -107,14 +113,26 @@ def resolve_hostname(ip_addr: str) -> str:
     except Exception:
         return ip_addr
 
+def normalize_hostname(value: str) -> str:
+    return value.strip().rstrip(".").lower()
+
 def certificate_matches_domain(cert_cn: str, domain: str) -> bool:
-    cert_cn = cert_cn.lower()
-    domain = domain.lower()
+    cert_cn = normalize_hostname(cert_cn)
+    domain = normalize_hostname(domain)
+
+    if not cert_cn or not domain or is_ip_address(domain):
+        return cert_cn == domain
+
     if cert_cn.startswith("*."):
         base = cert_cn[2:]
-        return domain.endswith(base)
-    else:
-        return cert_cn == domain
+        if not base:
+            return False
+
+        domain_labels = domain.split(".")
+        base_labels = base.split(".")
+        return len(domain_labels) == len(base_labels) + 1 and domain_labels[1:] == base_labels
+
+    return cert_cn == domain
 
 def parse_nmap_output(file_path: str) -> List[HostCipherInfo]:
     try:
@@ -206,17 +224,22 @@ def get_security_sets(update: bool = False) -> dict:
         log(f"[!] Could not save cipher cache: {e}", style="red", highlight=False)
     return security_sets
 
-def is_cipher_safe(cipher: str, security_sets: dict) -> bool:
+def classify_cipher_security(cipher: str, security_sets: dict) -> str:
     if cipher in security_sets.get("insecure", set()) or cipher in security_sets.get("weak", set()):
-        return False
+        return "weak"
     if cipher in security_sets.get("secure", set()) or cipher in security_sets.get("recommended", set()):
-        return True
-    return True
+        return "safe"
+    return "unknown"
+
+def is_cipher_safe(cipher: str, security_sets: dict) -> bool:
+    return classify_cipher_security(cipher, security_sets) == "safe"
 
 def check_ciphers_with_api(hosts_info: List[HostCipherInfo], update: bool) -> None:
     security_sets = get_security_sets(update)
     weak_ciphers_global = set()
+    unknown_ciphers_global = set()
     domain_weak_ciphers = {}
+    domain_unknown_ciphers = {}
     domain_tls_weak = {}
     global_tls_versions = set()
     for host in hosts_info:
@@ -224,18 +247,29 @@ def check_ciphers_with_api(hosts_info: List[HostCipherInfo], update: bool) -> No
         weak_tls_for_domain = {tls for tls in host.tls_versions if tls not in {"TLSv1.2", "TLSv1.3"}}
         domain_tls_weak[host.hostname] = weak_tls_for_domain
         weak_for_domain = []
+        unknown_for_domain = []
         if not host.ciphers:
             domain_weak_ciphers[host.hostname] = weak_for_domain
+            domain_unknown_ciphers[host.hostname] = unknown_for_domain
         else:
             log(f"[*] Processing target: [bold white]{host.hostname}[/bold white]", highlight=False)
             for cipher in host.ciphers:
-                safe = is_cipher_safe(cipher, security_sets)
+                classification = classify_cipher_security(cipher, security_sets)
                 if DEBUG:
-                    log(f"    [DEBUG] Cipher '{cipher}' is considered {'safe' if safe else 'unsafe'}.", style="green" if safe else "red", highlight=False)
-                if not safe:
+                    style = "green" if classification == "safe" else "red" if classification == "weak" else "yellow"
+                    log(
+                        f"    [DEBUG] Cipher '{cipher}' classified as {classification}.",
+                        style=style,
+                        highlight=False,
+                    )
+                if classification == "weak":
                     weak_for_domain.append(cipher)
                     weak_ciphers_global.add(cipher)
+                elif classification == "unknown":
+                    unknown_for_domain.append(cipher)
+                    unknown_ciphers_global.add(cipher)
             domain_weak_ciphers[host.hostname] = weak_for_domain
+            domain_unknown_ciphers[host.hostname] = unknown_for_domain
 
     log("\n========== Final Report ==========\n", style="bold white", highlight=False)
     if global_tls_versions - {"TLSv1.2", "TLSv1.3"}:
@@ -255,6 +289,12 @@ def check_ciphers_with_api(hosts_info: List[HostCipherInfo], update: bool) -> No
                 log(cipher, style="red", highlight=False)
     else:
         log("No weak ciphers detected.", style="green", highlight=False)
+    log("\nUnknown/Unclassified Ciphers:\n", style="bold white", highlight=False)
+    if unknown_ciphers_global:
+        for cipher in sorted(unknown_ciphers_global):
+            log(cipher, style="yellow", highlight=False)
+    else:
+        log("No unknown ciphers detected.", style="green", highlight=False)
     weak_tls_domains = [host.hostname for host in hosts_info if domain_tls_weak.get(host.hostname)]
     log("\nDomains/IP with TLS versions below 1.2:\n", style="bold white", highlight=False)
     if weak_tls_domains:
@@ -267,6 +307,13 @@ def check_ciphers_with_api(hosts_info: List[HostCipherInfo], update: bool) -> No
     if weak_cipher_domains:
         for domain in sorted(weak_cipher_domains):
             log(f"{domain}", style="red", highlight=False)
+    else:
+        log("None", style="green", highlight=False)
+    unknown_cipher_domains = [host.hostname for host in hosts_info if domain_unknown_ciphers.get(host.hostname)]
+    log("\nDomains/IP with unknown or unclassified cipher suites:\n", style="bold white", highlight=False)
+    if unknown_cipher_domains:
+        for domain in sorted(unknown_cipher_domains):
+            log(f"{domain}", style="yellow", highlight=False)
     else:
         log("None", style="green", highlight=False)
     log("\nDomain-wise Weak TLS Versions, Weak Ciphers and Certificate Info:\n", style="bold white", highlight=False)
@@ -293,6 +340,12 @@ def check_ciphers_with_api(hosts_info: List[HostCipherInfo], update: bool) -> No
                     log(f"    {cipher}", style="red", highlight=False)
         else:
             log("  No weak ciphers detected.", style="green", highlight=False)
+        if domain_unknown_ciphers.get(host.hostname):
+            log("  Unknown/Unclassified Ciphers:", style="bold white", highlight=False)
+            for cipher in sorted(set(domain_unknown_ciphers[host.hostname])):
+                log(f"    {cipher}", style="yellow", highlight=False)
+        else:
+            log("  No unknown ciphers detected.", style="green", highlight=False)
         if host.cert_cn:
             if is_ip_address(host.hostname) and not host.cert_cn.startswith("*."):
                 try:

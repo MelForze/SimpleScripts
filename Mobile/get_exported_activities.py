@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Скрипт: list_exported_activities.py
-Использование:
+Script: list_exported_activities.py
+Usage:
     python get_exported_activities.py /path/to/AndroidManifest.xml
 """
 
@@ -9,26 +9,21 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# URI пространства имён android
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
 NAME_ATTR = f"{{{ANDROID_NS}}}name"
 EXPORTED_ATTR = f"{{{ANDROID_NS}}}exported"
 
 
 def get_exported_activities(manifest_path: Path) -> list[str]:
-    """Возвращает список имён активити/алиасов с android:exported="true"."""
+    """Return activity/activity-alias names with android:exported="true"."""
     tree = ET.parse(manifest_path)
     root = tree.getroot()
 
-    # <application> может быть не единственным уровнем,
-    # поэтому используем find в случае неймспейсов
     application = root.find("application")
     if application is None:
         raise ValueError("В манифесте не найден тег <application>.")
 
     exported = []
-
-    # Ищем и <activity>, и <activity-alias>
     for tag in ("activity", "activity-alias"):
         for elem in application.findall(f".//{tag}"):
             if elem.attrib.get(EXPORTED_ATTR) == "true":

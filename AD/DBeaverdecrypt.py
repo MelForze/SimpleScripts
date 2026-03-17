@@ -1,40 +1,124 @@
-import sys
-import base64
-import os
-import json
-from Crypto.Cipher import AES
+#!/usr/bin/env python3
 
-default_paths = [
-  '~/Library/DBeaverData/workspace6/General/.dbeaver/credentials-config.json',
-  '~/.local/share/DBeaverData/workspace6/General/.dbeaver/credentials-config.json',
-  '~/.local/share/.DBeaverData/workspace6/General/.dbeaver/credentials-config.json',
-  '~/AppData/Roaming/DBeaverData/workspace6/General/.dbeaver/credentials-config.json',
+import argparse
+import json
+import os
+import sys
+
+
+DEFAULT_PATHS = [
+    "~/Library/DBeaverData/workspace6/General/.dbeaver/credentials-config.json",
+    "~/.local/share/DBeaverData/workspace6/General/.dbeaver/credentials-config.json",
+    "~/.local/share/.DBeaverData/workspace6/General/.dbeaver/credentials-config.json",
+    "~/AppData/Roaming/DBeaverData/workspace6/General/.dbeaver/credentials-config.json",
 ]
 
-if len(sys.argv) < 2:
-  for path in default_paths:
-    filepath = os.path.expanduser(path)
+PASSWORD_DECRYPTION_KEY = bytes(
+    [186, 187, 74, 159, 119, 74, 184, 83, 201, 108, 45, 101, 61, 254, 84, 74]
+)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Decrypt DBeaver credentials-config.json."
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        help="Path to credentials-config.json. If omitted, common default paths are checked.",
+    )
+    return parser.parse_args(argv)
+
+
+def resolve_credentials_path(cli_path=None):
+    if cli_path:
+        return os.path.abspath(os.path.expanduser(cli_path))
+
+    for path in DEFAULT_PATHS:
+        candidate = os.path.expanduser(path)
+        if os.path.isfile(candidate):
+            return candidate
+
+    return None
+
+
+def load_aes():
     try:
-      f = open(filepath, 'rb')
-      f.close()
-      break
-    except Exception as e:
-      pass
-else:
-  filepath = sys.argv[1]
+        from Crypto.Cipher import AES
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Missing dependency: install 'pycryptodome' to decrypt DBeaver credentials."
+        ) from exc
 
-print(filepath)
+    return AES
 
-#PASSWORD_DECRYPTION_KEY = bytes([-70, -69, 74, -97, 119, 74, -72, 83, -55, 108, 45, 101, 61, -2, 84, 74])
-PASSWORD_DECRYPTION_KEY = bytes([186, 187, 74, 159, 119, 74, 184, 83, 201, 108, 45, 101, 61, 254, 84, 74])
 
-data = open(filepath, 'rb').read()
+def remove_pkcs7_padding(data):
+    if not data:
+        raise ValueError("Encrypted payload is empty.")
 
-decryptor = AES.new(PASSWORD_DECRYPTION_KEY, AES.MODE_CBC, data[:16])
-padded_output = decryptor.decrypt(data[16:])
-output = padded_output.rstrip(padded_output[-1:])
+    padding_len = data[-1]
+    if padding_len < 1 or padding_len > 16:
+        raise ValueError("Invalid PKCS#7 padding length.")
 
-try:
-  print(json.dumps(json.loads(output), indent=4, sort_keys=True))
-except:
-  print(output)
+    if data[-padding_len:] != bytes([padding_len]) * padding_len:
+        raise ValueError("Invalid PKCS#7 padding bytes.")
+
+    return data[:-padding_len]
+
+
+def decrypt_bytes(data):
+    if len(data) <= 16:
+        raise ValueError("Encrypted file is too short to contain IV and ciphertext.")
+
+    ciphertext = data[16:]
+    if len(ciphertext) % 16 != 0:
+        raise ValueError("Ciphertext length must be a multiple of AES block size.")
+
+    aes = load_aes()
+    decryptor = aes.new(PASSWORD_DECRYPTION_KEY, aes.MODE_CBC, data[:16])
+    padded_output = decryptor.decrypt(ciphertext)
+    return remove_pkcs7_padding(padded_output)
+
+
+def decrypt_file(filepath):
+    with open(filepath, "rb") as handle:
+        data = handle.read()
+    return decrypt_bytes(data)
+
+
+def format_output(plaintext):
+    try:
+        return json.dumps(json.loads(plaintext), indent=4, sort_keys=True)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return plaintext.decode("utf-8", errors="replace")
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    filepath = resolve_credentials_path(args.path)
+
+    if not filepath:
+        print(
+            "Error: credentials-config.json not found. Provide a file path explicitly.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not os.path.isfile(filepath):
+        print(f"Error: file not found: {filepath}", file=sys.stderr)
+        return 1
+
+    try:
+        plaintext = decrypt_file(filepath)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(filepath)
+    print(format_output(plaintext))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

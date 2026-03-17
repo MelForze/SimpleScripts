@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+import argparse
 import subprocess
 import sys
 from pathlib import Path
-import argparse
 
 # --- Configuration for crawl modes ---
 FOLDERS = {
@@ -31,7 +31,8 @@ def sanitize_filename(url: str) -> str:
                .replace(':', '_')
                .replace('/', '_'))
 
-def run_katana(url: str, out_dir: Path, extra_opts: list[str], use_headless: bool) -> None:
+
+def run_katana(url: str, out_dir: Path, extra_opts: list[str], use_headless: bool) -> bool:
     """
     Run katana on a URL in a specific mode, sort the output,
     prepend URL for 'paths' mode, and clean up temp files.
@@ -58,18 +59,21 @@ def run_katana(url: str, out_dir: Path, extra_opts: list[str], use_headless: boo
         if out_dir.name == 'paths':
             with final.open('w') as out:
                 out.write(url + "\n")
-                out.write(sorted_tmp.read_text())
+                out.write(sorted_tmp.read_text(encoding="utf-8"))
         else:
             sorted_tmp.replace(final)
 
-    except subprocess.CalledProcessError as e:
-        print(f"[!] Error in {out_dir.name} for {url}: {e}")
+        return True
+    except (subprocess.CalledProcessError, OSError) as exc:
+        print(f"[!] Error in {out_dir.name} for {url}: {exc}", file=sys.stderr)
+        return False
     finally:
         for fp in (temp, sorted_tmp):
             if fp.exists():
                 fp.unlink()
 
-def main():
+
+def parse_args(argv=None):
     """Main: parse args, create dirs based on selection, run katana per mode."""
     parser = argparse.ArgumentParser(
         description="Run katana in selected modes: allurls, files, paths."
@@ -83,12 +87,14 @@ def main():
                         help="Crawl only files (files mode)")
     parser.add_argument('-path', '--path', action='store_true',
                         help="Crawl only paths (paths mode)")
+    return parser.parse_args(argv)
 
-    args = parser.parse_args()
 
+def main(argv=None) -> int:
+    args = parse_args(argv)
     if not args.url_file.is_file():
-        print(f"[!] URL file not found: {args.url_file}")
-        sys.exit(1)
+        print(f"[!] URL file not found: {args.url_file}", file=sys.stderr)
+        return 1
 
     # Determine selected modes
     selected = []
@@ -99,22 +105,34 @@ def main():
     if args.path:
         selected.append('paths')
     if not selected:
-        print("[!] Please specify at least one of --all, --file, or --path")
-        sys.exit(1)
+        print("[!] Please specify at least one of --all, --file, or --path", file=sys.stderr)
+        return 1
 
-    urls = [u.strip() for u in args.url_file.read_text().splitlines() if u.strip()]
+    urls = [u.strip() for u in args.url_file.read_text(encoding="utf-8").splitlines() if u.strip()]
     if not urls:
-        print("[!] No URLs to process.")
-        sys.exit(1)
+        print("[!] No URLs to process.", file=sys.stderr)
+        return 1
 
     # Create only necessary directories
     for mode in selected:
         Path(mode).mkdir(exist_ok=True)
 
+    failures = []
     # Run katana in each selected mode
     for url in urls:
         for mode in selected:
-            run_katana(url, Path(mode), FOLDERS[mode], use_headless=args.browser)
+            success = run_katana(url, Path(mode), FOLDERS[mode], use_headless=args.browser)
+            if not success:
+                failures.append((url, mode))
+
+    if failures:
+        print(f"[!] Katana failed for {len(failures)} target/mode combinations.", file=sys.stderr)
+        for url, mode in failures:
+            print(f"    - {url} ({mode})", file=sys.stderr)
+        return 1
+
+    return 0
+
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

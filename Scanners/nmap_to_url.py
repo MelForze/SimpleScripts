@@ -3,10 +3,11 @@
 
 import xml.etree.ElementTree as ET
 import argparse
-import os
-import sys
 import logging
 import re
+import ipaddress
+from pathlib import Path
+from typing import Sequence
 from urllib.parse import urlsplit
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -37,42 +38,56 @@ _SCHEME_RE = re.compile(r'^\s*(?:https?://)', re.I)
 
 def _normalize_host(raw: str) -> str:
     """
-    Normalize a host value:
-    - Strip scheme (http/https), path, userinfo, and port.
-    - Keep only the hostname.
-    - Wrap bare IPv6 literals in [] for use inside URLs.
+    Normalize a target value to a URL-ready host:
+    - Strip scheme, path, userinfo, and optional port.
+    - Preserve bare IPv6 literals (do not split by ':').
+    - Wrap IPv6 host values in square brackets for URL formatting.
     - Trim trailing dot from FQDN.
-    Works for inputs like: "https://host:8080", "host:8080", "host/",
-    "2001:db8::1", "[2001:db8::1]:443", etc.
     """
     if not raw:
         return raw
 
     s = raw.strip()
+    host = None
 
-    # Use urlsplit to parse hostname. For "host:port" without scheme,
-    # prefix with "//" so hostname/port are parsed as netloc.
-    # See Python docs and common recipes for parsing host:port with urlsplit.
-    # https://docs.python.org/3/library/urllib.parse.html#urllib.parse.urlsplit
-    # https://stackoverflow.com/a/53188245
     if _SCHEME_RE.match(s):
-        parts = urlsplit(s)
+        host = urlsplit(s).hostname
     else:
-        parts = urlsplit('//' + s)
+        candidate = re.split(r"[/?#]", s, maxsplit=1)[0]
+        if "@" in candidate:
+            candidate = candidate.rsplit("@", 1)[1]
 
-    host = parts.hostname or s
+        if candidate.startswith("["):
+            closing = candidate.find("]")
+            if closing != -1:
+                host = candidate[1:closing]
+            else:
+                host = candidate.lstrip("[")
+        else:
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                if candidate.count(":") == 1:
+                    maybe_host, maybe_port = candidate.rsplit(":", 1)
+                    if maybe_port.isdigit():
+                        candidate = maybe_host
+                host = urlsplit("//" + candidate).hostname or candidate
+            else:
+                host = candidate
+
+    host = host or s
 
     # Remove trailing dot from FQDN (nmap may output it)
     if host.endswith('.'):
         host = host[:-1]
 
-    # If it's an IPv6 literal (hostname will not include the port here),
-    # wrap it in square brackets to form a valid URL host.
-    # RFC 3986 requires brackets for IPv6 in URLs.
-    # https://datatracker.ietf.org/doc/html/rfc3986
-    if ':' in host and not host.startswith('[') and not host.endswith(']'):
-        host = f'[{host}]'
+    try:
+        parsed_ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host.lower()
 
+    if parsed_ip.version == 6:
+        return f"[{host}]"
     return host
 
 
@@ -146,23 +161,18 @@ def build_url(target, port_element):
     return _format_url_host_port(host, portid, protocol)
 
 
-def parse_nmap_xml(input_file, output_file):
+def parse_nmap_xml(input_file: str | Path, output_file: str | Path) -> bool:
     """
     Parse nmap XML and extract URLs for HTTP/HTTPS services.
     Handles cases where the target name itself includes http(s)://.
     """
-    input_file = os.path.abspath(input_file)
-    output_file = os.path.abspath(output_file)
+    input_path = Path(input_file).expanduser().resolve()
+    output_path = Path(output_file).expanduser().resolve()
 
-    if not os.path.isfile(input_file):
-        logging.error(f"File {input_file} does not exist.")
-        sys.exit(1)
+    if not input_path.is_file():
+        raise FileNotFoundError(f"File {input_path} does not exist.")
 
-    try:
-        tree = ET.parse(input_file)
-    except ET.ParseError as e:
-        logging.error(f"Failed to parse XML: {e}")
-        sys.exit(1)
+    tree = ET.parse(input_path)
 
     root = tree.getroot()
 
@@ -183,20 +193,50 @@ def parse_nmap_xml(input_file, output_file):
 
     if not extracted_urls:
         logging.warning("No matching URLs were found.")
-    else:
-        with open(output_file, 'w', encoding='utf-8') as f:
-            for url in extracted_urls:
-                f.write(url + '\n')
-        logging.info(f"URLs were written to {output_file}")
+        return False
+
+    with output_path.open('w', encoding='utf-8') as handle:
+        for url in extracted_urls:
+            handle.write(url + '\n')
+    logging.info("URLs were written to %s", output_path)
+    return True
 
 
-def main():
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Extract HTTP/HTTPS URLs from nmap XML.')
-    parser.add_argument('input_file', type=str, help='Input nmap XML file')
-    parser.add_argument('output_file', type=str, help='Output file to write URLs')
-    args = parser.parse_args()
-    parse_nmap_xml(args.input_file, args.output_file)
+    parser.add_argument('input_file', nargs='?', type=str, help='Input nmap XML file (legacy positional argument)')
+    parser.add_argument('output_file', nargs='?', type=str, help='Output file to write URLs (legacy positional argument)')
+    parser.add_argument('-i', '--input', dest='input_opt', type=str, help='Input nmap XML file')
+    parser.add_argument('-o', '--output', dest='output_opt', type=str, help='Output file to write URLs')
+    args = parser.parse_args(argv)
+
+    resolved_input = args.input_opt or args.input_file
+    resolved_output = args.output_opt or args.output_file
+    if not resolved_input or not resolved_output:
+        parser.error("Input and output are required (use positional args or -i/-o).")
+
+    args.input_file = resolved_input
+    args.output_file = resolved_output
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    try:
+        parse_nmap_xml(args.input_file, args.output_file)
+    except FileNotFoundError as exc:
+        logging.error("%s", exc)
+        return 1
+    except ET.ParseError as exc:
+        logging.error("Failed to parse XML: %s", exc)
+        return 1
+    except OSError as exc:
+        logging.error("I/O error: %s", exc)
+        return 1
+
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

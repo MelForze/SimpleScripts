@@ -4,13 +4,36 @@ import ssl
 import hashlib
 import time
 import argparse
+import ipaddress
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from rich.progress import Progress
-from rich.console import Console
-from rich.markup import escape  # на случай, если понадобится экранировать вручную
 
-# Отключаем разбор встроенной разметки Rich по умолчанию,
-# чтобы строки с квадратными скобками не ломали вывод.
+try:
+    from rich.progress import Progress
+    from rich.console import Console
+except ModuleNotFoundError:
+    class Progress:  # type: ignore[no-redef]
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def add_task(self, *args, total=None, **kwargs):
+            return 0
+
+        def advance(self, *args, **kwargs):
+            return None
+
+    class Console:  # type: ignore[no-redef]
+        def __init__(self, markup=False):
+            self.markup = markup
+
+        def print(self, *args, **kwargs):
+            print(*args)
+
+# Disable Rich markup parsing by default so strings with square brackets
+# are printed literally and do not break the output.
 console = Console(markup=False)
 
 def print_banner():
@@ -22,7 +45,7 @@ def print_banner():
         "[red]|__/|__/_/_/\\__,_/\\___/\\__,_/_/   \\__,_/_/ /_/\\__,_/_/ /_/\\__/\\___/_/     [/red]\n"
         "[blue]                                                                     [/blue]"
     )
-    # Баннер выводим с включённой разметкой
+    # Render the banner with markup enabled.
     console.print(banner, markup=True)
     console.print(
         "This script compares SSL certificate fingerprints and detects certificate reuse between domains. "
@@ -36,9 +59,15 @@ class BannerHelpAction(argparse._HelpAction):
         parser.print_help()
         parser.exit()
 
+def build_fingerprint_ssl_context():
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
 def get_certificate_fingerprint(host, port, hash_func='sha256', timeout=5):
     try:
-        context = ssl.create_default_context()
+        context = build_fingerprint_ssl_context()
         with socket.create_connection((host, port), timeout=timeout) as sock:
             with context.wrap_socket(sock, server_hostname=host) as ssock:
                 cert_bin = ssock.getpeercert(binary_form=True)
@@ -51,19 +80,34 @@ def get_certificate_fingerprint(host, port, hash_func='sha256', timeout=5):
 
 def parse_line(line):
     """
-    Поддерживает форматы:
+    Supported formats:
       - 'domain [443,8443]'
       - 'domain:443'
       - 'domain 443'
-      - 'domain' (без портов; полагаемся на -p)
-    Комментарии после '#' игнорируются.
+      - 'domain' (without ports; rely on -p)
+    Comments after '#' are ignored.
     """
-    # Убираем комментарий и пробелы по краям
+    # Remove trailing comments and surrounding whitespace.
     line = line.split('#', 1)[0].strip()
     if not line:
         return None, []
 
-    # Формат: domain [443,8443]
+    # Format: [2001:db8::1]:443
+    if line.startswith('['):
+        match = re.fullmatch(r'\[(?P<host>.+)\](?::(?P<port>\d+))?', line)
+        if match:
+            host = match.group('host').strip()
+            port = match.group('port')
+            return host or None, [int(port)] if port else []
+
+    # Do not interpret a plain IPv6 literal as host:port.
+    try:
+        ipaddress.ip_address(line)
+        return line, []
+    except ValueError:
+        pass
+
+    # Format: domain [443,8443]
     if '[' in line and ']' in line:
         try:
             before, after = line.split('[', 1)
@@ -76,21 +120,21 @@ def parse_line(line):
                     ports.append(int(p))
             return (domain if domain else None), ports
         except ValueError:
-            # Кривые скобки — трактуем как просто домен
+            # Malformed brackets: treat the line as a plain domain.
             return line.strip() or None, []
 
-    # Формат: domain:443 (берём последний ':')
+    # Format: domain:443 (split on the last ':')
     if ':' in line:
         host, maybe_port = line.rsplit(':', 1)
         if maybe_port.isdigit():
             return host.strip() or None, [int(maybe_port)]
 
-    # Формат: domain 443
+    # Format: domain 443
     parts = line.split()
     if len(parts) == 2 and parts[1].isdigit():
         return parts[0], [int(parts[1])]
 
-    # Просто домен / IP
+    # Plain domain or IP.
     return line.split()[0], []
 
 def process_task(task, filename, debug):

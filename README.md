@@ -7,6 +7,24 @@
 
 This repository consists of scripts that can make life easier for both me and you by helping with information gathering and structuring.
 
+## Installation
+
+### pipx
+
+You can install the repository directly with `pipx`:
+
+```bash
+pipx install git+https://github.com/MelForze/SimpleScripts.git
+```
+
+For local development / local checkout:
+
+```bash
+pipx install .
+```
+
+This installs the repository scripts into your `pipx` bin directory, so you can run tools such as `DBeaverdecrypt.py`, `HeadersHunter.py`, `masscan_to_url.py`, `maketask`, or `pivot_access_init.sh` directly from your shell.
+
 ## To Do
 
 - [x] **Create Wildcard Hunter Script**  

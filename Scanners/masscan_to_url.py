@@ -13,10 +13,13 @@ Supported input formats:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 # Regex for "Discovered" style lines
 RE_DISCOVERED = re.compile(
@@ -48,7 +51,7 @@ SCHEME_DEFAULT_PORT: Dict[str, int] = {
 }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Convert masscan output to a list of HTTP/HTTPS URLs."
@@ -73,7 +76,7 @@ def parse_args() -> argparse.Namespace:
             "(e.g. http://1.2.3.4 instead of http://1.2.3.4:80)."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def read_lines(path: Path | None) -> Iterable[str]:
@@ -212,16 +215,26 @@ def write_urls(urls: Iterable[str], path: Path | None) -> None:
         path.write_text(output_text, encoding="utf-8")
 
 
-def main() -> None:
+def main(argv: List[str] | None = None) -> int:
     """Main entry point."""
-    args = parse_args()
-    lines = read_lines(args.input)
-    urls = masscan_to_urls(
-        lines=lines,
-        omit_default_port=args.omit_default_port,
-    )
-    write_urls(urls, args.output)
+    args = parse_args(argv)
+    if args.input is not None and not args.input.is_file():
+        logging.error("Input file does not exist: %s", args.input)
+        return 1
+
+    try:
+        lines = read_lines(args.input)
+        urls = masscan_to_urls(
+            lines=lines,
+            omit_default_port=args.omit_default_port,
+        )
+        write_urls(urls, args.output)
+    except OSError as exc:
+        logging.error("I/O error: %s", exc)
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
