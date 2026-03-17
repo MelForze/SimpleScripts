@@ -22,14 +22,15 @@ DEPENDENCIES = [
 ]
 ROOT = Path(__file__).resolve().parent
 DIST_INFO_DIRNAME = f"{PROJECT_NAME}-{VERSION}.dist-info"
-SCRIPTS_DIRNAME = f"{PROJECT_NAME}-{VERSION}.data/scripts"
 SDIST_DIRNAME = f"{PROJECT_NAME}-{VERSION}"
 WHEEL_FILENAME = f"{PROJECT_NAME}-{VERSION}-py3-none-any.whl"
+SCRIPT_BUNDLE_DIR = "simplescripts_scripts"
+LAUNCHER_MODULE = "simplescripts_launcher.py"
 
 SCRIPT_SPECS = [
     ("AD/DBeaverdecrypt.py", "DBeaverdecrypt.py"),
     ("AD/DomainSid-Hex.py", "DomainSid-Hex.py"),
-    ("AD/gpp_decrypt.py", "GPP_decrypt.py"),
+    ("AD/GPP_decrypt.py", "GPP_decrypt.py"),
     ("AD/LMHunter.py", "LMHunter.py"),
     ("AD/NTCreater.py", "NTCreater.py"),
     ("AD/PowerShellPayload.py", "PowerShellPayload.py"),
@@ -100,6 +101,79 @@ def _wheel_text() -> str:
     )
 
 
+def _entry_points_text() -> str:
+    lines = ["[console_scripts]"]
+    for _, install_name in SCRIPT_SPECS:
+        lines.append(f"{install_name} = simplescripts_launcher:main")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _launcher_module_text() -> str:
+    lines = [
+        "from __future__ import annotations",
+        "",
+        "import runpy",
+        "import shutil",
+        "import subprocess",
+        "import sys",
+        "from pathlib import Path",
+        "",
+        "SCRIPT_MAP = {",
+    ]
+    for source, install_name in SCRIPT_SPECS:
+        lines.append(f"    {install_name!r}: {source!r},")
+    lines.extend(
+        [
+            "}",
+            "",
+            "",
+            "def _find_script_path(command_name: str) -> Path | None:",
+            "    rel = SCRIPT_MAP.get(command_name)",
+            "    if rel is None and command_name.lower().endswith('.exe'):",
+            "        rel = SCRIPT_MAP.get(command_name[:-4])",
+            "    if rel is None:",
+            "        return None",
+            "    return Path(__file__).resolve().parent / 'simplescripts_scripts' / rel",
+            "",
+            "",
+            "def main() -> int:",
+            "    command_name = Path(sys.argv[0]).name",
+            "    script_path = _find_script_path(command_name)",
+            "    if script_path is None or not script_path.is_file():",
+            "        print(f'Unknown or missing script mapping for: {command_name}', file=sys.stderr)",
+            "        return 1",
+            "",
+            "    suffix = script_path.suffix.lower()",
+            "    if suffix in {'.py', ''}:",
+            "        sys.argv[0] = str(script_path)",
+            "        runpy.run_path(str(script_path), run_name='__main__')",
+            "        return 0",
+            "",
+            "    if suffix == '.sh':",
+            "        proc = subprocess.run(['bash', str(script_path), *sys.argv[1:]])",
+            "        return int(proc.returncode)",
+            "",
+            "    if suffix == '.ps1':",
+            "        shell = shutil.which('pwsh') or shutil.which('powershell')",
+            "        if not shell:",
+            "            print('PowerShell runtime not found (pwsh/powershell).', file=sys.stderr)",
+            "            return 1",
+            "        proc = subprocess.run([shell, '-File', str(script_path), *sys.argv[1:]])",
+            "        return int(proc.returncode)",
+            "",
+            "    print(f'Unsupported script type: {script_path}', file=sys.stderr)",
+            "    return 1",
+            "",
+            "",
+            "if __name__ == '__main__':",
+            "    raise SystemExit(main())",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _record_row(path: str, data: bytes) -> tuple[str, str, str]:
     digest = hashlib.sha256(data).digest()
     encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
@@ -118,6 +192,7 @@ def _dist_info_contents() -> dict[str, bytes]:
     return {
         f"{DIST_INFO_DIRNAME}/METADATA": _metadata_text().encode("utf-8"),
         f"{DIST_INFO_DIRNAME}/WHEEL": _wheel_text().encode("utf-8"),
+        f"{DIST_INFO_DIRNAME}/entry_points.txt": _entry_points_text().encode("utf-8"),
     }
 
 
@@ -173,9 +248,13 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         for source, install_name in SCRIPT_SPECS:
             source_path = ROOT / source
             data = source_path.read_bytes()
-            arcname = f"{SCRIPTS_DIRNAME}/{install_name}"
-            archive.writestr(_zip_info(arcname, executable=True), data)
+            arcname = f"{SCRIPT_BUNDLE_DIR}/{source}"
+            archive.writestr(_zip_info(arcname, executable=False), data)
             rows.append(_record_row(arcname, data))
+
+        launcher_data = _launcher_module_text().encode("utf-8")
+        archive.writestr(_zip_info(LAUNCHER_MODULE, executable=False), launcher_data)
+        rows.append(_record_row(LAUNCHER_MODULE, launcher_data))
 
         record_data = _build_record(rows)
         archive.writestr(
