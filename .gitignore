@@ -1,12 +1,13 @@
 .DS_Store
-.vscode
+.vscode/
 __pycache__/
 *.pyc
 build/
 dist/
 *.egg-info/
-test_inputs/
+ffuf/
+katana/
+urls.txt
 Development/
 tests/
 test_inputs/
-

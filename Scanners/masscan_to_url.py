@@ -14,10 +14,17 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
 import re
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
+
+
+def create_argument_parser(*args, **kwargs):
+    try:
+        return argparse.ArgumentParser(*args, color=False, **kwargs)
+    except TypeError:
+        return argparse.ArgumentParser(*args, **kwargs)
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
@@ -35,11 +42,12 @@ RE_LIST = re.compile(
 HTTP_PORTS = {
     80: "http",
     443: "https",
-    8080: "http",
-    8443: "https",
     8000: "http",
     8008: "http",
+    8080: "http",
     8081: "http",
+    8443: "https",
+    8888: "http",
     9000: "http",
     9443: "https",
 }
@@ -53,7 +61,7 @@ SCHEME_DEFAULT_PORT: Dict[str, int] = {
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(
+    parser = create_argument_parser(
         description="Convert masscan output to a list of HTTP/HTTPS URLs."
     )
     parser.add_argument(
@@ -67,14 +75,6 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         "--output",
         type=Path,
         help="Output file for URLs (default: stdout).",
-    )
-    parser.add_argument(
-        "--omit-default-port",
-        action="store_true",
-        help=(
-            "Omit port in URL if it matches scheme's default port "
-            "(e.g. http://1.2.3.4 instead of http://1.2.3.4:80)."
-        ),
     )
     return parser.parse_args(argv)
 
@@ -106,6 +106,9 @@ def extract_hosts_ports(line: str) -> List[Tuple[str, int]]:
     # Match "Discovered open port ..." style
     m = RE_DISCOVERED.search(line)
     if m:
+        protocol = m.group(2).lower()
+        if protocol != "tcp":
+            return results
         port = int(m.group(1))
         host = m.group(3)
         results.append((host, port))
@@ -113,6 +116,9 @@ def extract_hosts_ports(line: str) -> List[Tuple[str, int]]:
     # Match list-output "open tcp 80 1.2.3.4" style
     m = RE_LIST.search(line)
     if m:
+        protocol = m.group(1).lower()
+        if protocol != "tcp":
+            return results
         port = int(m.group(2))
         host = m.group(3)
         results.append((host, port))
@@ -144,7 +150,6 @@ def port_to_web_scheme(port: int) -> str | None:
 def make_url(
     host: str,
     port: int,
-    omit_default_port: bool,
 ) -> str | None:
     """
     Build an HTTP/HTTPS URL from host and port.
@@ -160,15 +165,13 @@ def make_url(
     default_port = SCHEME_DEFAULT_PORT.get(scheme)
 
     # Decide whether to include port in the URL
-    if omit_default_port and default_port is not None and port == default_port:
+    if default_port is not None and port == default_port:
         return f"{scheme}://{normalized_host}"
-    else:
-        return f"{scheme}://{normalized_host}:{port}"
+    return f"{scheme}://{normalized_host}:{port}"
 
 
 def masscan_to_urls(
     lines: Iterable[str],
-    omit_default_port: bool = False,
 ) -> List[str]:
     """
     Convert an iterable of masscan output lines to a list of unique HTTP/HTTPS URLs.
@@ -188,7 +191,6 @@ def masscan_to_urls(
             url = make_url(
                 host=host,
                 port=port,
-                omit_default_port=omit_default_port,
             )
             if url is None:
                 # Non-web port, skip it
@@ -224,10 +226,10 @@ def main(argv: List[str] | None = None) -> int:
 
     try:
         lines = read_lines(args.input)
-        urls = masscan_to_urls(
-            lines=lines,
-            omit_default_port=args.omit_default_port,
-        )
+        urls = masscan_to_urls(lines=lines)
+        if not urls:
+            logging.warning("No matching HTTP/HTTPS URLs were found.")
+            return 2
         write_urls(urls, args.output)
     except OSError as exc:
         logging.error("I/O error: %s", exc)

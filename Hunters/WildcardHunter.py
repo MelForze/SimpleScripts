@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-import socket
-import ssl
-import hashlib
-import time
+
+from __future__ import annotations
+
 import argparse
+import hashlib
 import ipaddress
 import re
+import socket
+import ssl
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def create_argument_parser(*args, **kwargs):
+    try:
+        return argparse.ArgumentParser(*args, color=False, **kwargs)
+    except TypeError:
+        return argparse.ArgumentParser(*args, **kwargs)
 
 try:
     from rich.progress import Progress
@@ -35,6 +44,10 @@ except ModuleNotFoundError:
 # Disable Rich markup parsing by default so strings with square brackets
 # are printed literally and do not break the output.
 console = Console(markup=False)
+
+
+class FileProcessingError(RuntimeError):
+    pass
 
 def print_banner():
     banner = (
@@ -155,7 +168,7 @@ def process_file(filename, debug=False, default_ports=None):
     bad_lines = 0
 
     try:
-        with open(filename, 'r') as f:
+        with open(filename, 'r', encoding='utf-8') as f:
             for raw_line in f:
                 line = raw_line.rstrip('\n')
                 if not line.strip() or line.lstrip().startswith('#'):
@@ -176,9 +189,8 @@ def process_file(filename, debug=False, default_ports=None):
                 except Exception as e:
                     bad_lines += 1
                     console.print(f"{filename}: skip line -> {repr(line)} ({e})", style="yellow")
-    except Exception as e:
-        console.print(f"Error processing file {filename}: {e}", style="bold red")
-        return results
+    except OSError as e:
+        raise FileProcessingError(f"Error processing file {filename}: {e}") from e
 
     if bad_lines:
         console.print(f"[{filename}] Skipped malformed lines: {bad_lines}", style="yellow")
@@ -203,7 +215,12 @@ def process_file(filename, debug=False, default_ports=None):
         with ThreadPoolExecutor(max_workers=20) as executor:
             future_to_task = {executor.submit(process_task, task, filename, debug): task for task in tasks}
             for future in as_completed(future_to_task):
-                domain, port, fp = future.result()
+                try:
+                    domain, port, fp = future.result()
+                except Exception as exc:
+                    console.print(f"Worker error while processing {filename}: {exc}", style="bold red")
+                    progress.advance(task_progress)
+                    continue
                 if fp:
                     results.setdefault(fp, []).append((domain, port))
                 progress.advance(task_progress)
@@ -232,8 +249,8 @@ def parse_ports_arg(ports_str):
             console.print(f"Warning: skipping invalid port '{part}' in -p.", style="yellow")
     return ports or None
 
-def main():
-    parser = argparse.ArgumentParser(
+def main(argv: list[str] | None = None) -> int:
+    parser = create_argument_parser(
         usage="WildcardHunter.py [-h] -s SCOPE.txt -out OUTSCOPE.txt [-p PORTS] [-debug] [-print] [-o OUTPUT]",
         add_help=False
     )
@@ -244,7 +261,7 @@ def main():
     parser.add_argument('-debug', action='store_true', help="Enable debug mode")
     parser.add_argument('-print', action='store_true', help="Print certificate fingerprint in output")
     parser.add_argument('-o', '--output', help="Path to output file for results")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     debug = args.debug
     print_fingerprint = args.print
@@ -254,11 +271,15 @@ def main():
     default_ports = parse_ports_arg(args.ports)
 
     print_banner()
-    console.print("Processing scope domains...", style="bold blue")
-    scope_data = process_file(scope_file, debug=debug, default_ports=default_ports)
+    try:
+        console.print("Processing scope domains...", style="bold blue")
+        scope_data = process_file(scope_file, debug=debug, default_ports=default_ports)
 
-    console.print("\nProcessing outscope domains...", style="bold blue")
-    outscope_data = process_file(outscope_file, debug=debug, default_ports=default_ports)
+        console.print("\nProcessing outscope domains...", style="bold blue")
+        outscope_data = process_file(outscope_file, debug=debug, default_ports=default_ports)
+    except FileProcessingError as exc:
+        console.print(str(exc), style="bold red")
+        return 1
 
     scope_domains = {domain for entries in scope_data.values() for (domain, _) in entries}
     outscope_data = preprocess_outscope_data(outscope_data, scope_domains)
@@ -289,12 +310,15 @@ def main():
 
     if output_file:
         try:
-            with open(output_file, 'w') as f:
+            with open(output_file, 'w', encoding='utf-8') as f:
                 for line in output_messages:
                     f.write(line + "\n")
             console.print(f"Results written to {output_file}", style="bold green")
-        except Exception as e:
+        except OSError as e:
             console.print(f"Error writing to file {output_file}: {e}", style="bold red")
+            return 1
+
+    return 0
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

@@ -1,36 +1,97 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Extract HTTP/HTTPS URLs from nmap XML output."""
 
-import xml.etree.ElementTree as ET
 import argparse
+import ipaddress
 import logging
 import re
-import ipaddress
+import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Sequence
 from urllib.parse import urlsplit
 
+
+def create_argument_parser(*args, **kwargs):
+    try:
+        return argparse.ArgumentParser(*args, color=False, **kwargs)
+    except TypeError:
+        return argparse.ArgumentParser(*args, **kwargs)
+
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
+WEB_PORT_SCHEMES = {
+    80: "http",
+    443: "https",
+    8000: "http",
+    8008: "http",
+    8080: "http",
+    8081: "http",
+    8443: "https",
+    8888: "http",
+    9000: "http",
+    9443: "https",
+}
 
-def resolve_target(host):
-    """Return domain if present in <host>, otherwise return IP."""
-    ip = None
-    domain = None
 
-    # Extract IP address
+def resolve_targets(host: ET.Element, all_hostnames: bool = False) -> list[str]:
+    """
+    Return one or more targets for a host.
+
+    Prefer hostname(s) when present; otherwise return an IP address.
+    When selecting an IP, prefer addrtype in this order: ipv4, then ipv6.
+    If neither ipv4 nor ipv6 is found, return any available addr.
+    """
+    ipv4_addrs = []
+    ipv6_addrs = []
+    other_addrs = []
+    hostnames = []
+
     for address in host.findall('address'):
         addr = address.get('addr')
-        if addr:
-            ip = addr
+        atype = (address.get('addrtype') or '').lower()
+        if not addr:
+            continue
+        if atype == 'ipv4':
+            ipv4_addrs.append(addr)
+        elif atype == 'ipv6':
+            ipv6_addrs.append(addr)
+        else:
+            other_addrs.append(addr)
 
-    # Extract hostname
     for hostname in host.findall('./hostnames/hostname'):
         name = hostname.get('name')
         if name:
-            domain = name
+            hostnames.append(name)
 
-    return domain if domain else ip
+    if hostnames:
+        if all_hostnames:
+            return hostnames
+        return [hostnames[0]]
+
+    if ipv4_addrs:
+        return [ipv4_addrs[0]]
+    if ipv6_addrs:
+        return [ipv6_addrs[0]]
+    if other_addrs:
+        return [other_addrs[0]]
+    return []
+
+
+def resolve_target(host: ET.Element) -> str | None:
+    """Backward-compatible single-target resolver."""
+    targets = resolve_targets(host)
+    if not targets:
+        return None
+    return targets[0]
+
+
+def host_is_up(host: ET.Element) -> bool:
+    """Return True when the host is up or when status is absent."""
+    status = host.find("status")
+    if status is None:
+        return True
+    return (status.get("state") or "").lower() == "up"
 
 
 _SCHEME_RE = re.compile(r'^\s*(?:https?://)', re.I)
@@ -138,36 +199,69 @@ def _format_url_host_port(host: str, portid: str, protocol: str) -> str:
     return f"{protocol}://{host}:{portid}/"
 
 
-def build_url(target, port_element):
+def _guess_scheme_by_port(portid: str | None) -> str | None:
+    """Return a guessed HTTP/HTTPS scheme for common web ports."""
+    if not portid:
+        return None
+    try:
+        port_num = int(portid)
+    except ValueError:
+        return None
+    return WEB_PORT_SCHEMES.get(port_num)
+
+
+def build_url(target: str, port_element: ET.Element) -> str | None:
     """
     Build a URL from a <port> element if it is HTTP/HTTPS (including SSL-wrapped).
     """
     portid = port_element.get('portid')
+    protocol_attr = (port_element.get('protocol') or '').lower()
     state_element = port_element.find('state')
     service_element = port_element.find('service')
+
+    if protocol_attr != 'tcp':
+        return None
 
     if state_element is None or state_element.get('state') != 'open':
         return None
 
     service = (service_element.get('name') if service_element is not None else '') or ''
     tunnel = (service_element.get('tunnel') if service_element is not None else '') or ''
+    guessed_protocol = _guess_scheme_by_port(portid)
 
-    if not _is_httpish(service):
+    if _is_httpish(service):
+        protocol = 'https' if _is_ssl_like(service, tunnel) or service.lower() == 'https' else 'http'
+    elif guessed_protocol is not None:
+        protocol = guessed_protocol
+    else:
         return None
-
-    protocol = 'https' if _is_ssl_like(service, tunnel) or service.lower() == 'https' else 'http'
 
     host = _normalize_host(target)
     return _format_url_host_port(host, portid, protocol)
 
 
-def parse_nmap_xml(input_file: str | Path, output_file: str | Path) -> bool:
+def _write_urls(extracted_urls: list[str], output_path: Path | None) -> None:
+    output_text = "".join(f"{url}\n" for url in extracted_urls)
+    if output_path is None:
+        sys.stdout.write(output_text)
+        return
+
+    with output_path.open('w', encoding='utf-8') as handle:
+        handle.write(output_text)
+    logging.info("URLs were written to %s", output_path)
+
+
+def parse_nmap_xml(
+    input_file: str | Path,
+    output_file: str | Path | None,
+    all_hostnames: bool = False,
+) -> bool:
     """
     Parse nmap XML and extract URLs for HTTP/HTTPS services.
     Handles cases where the target name itself includes http(s)://.
     """
     input_path = Path(input_file).expanduser().resolve()
-    output_path = Path(output_file).expanduser().resolve()
+    output_path = Path(output_file).expanduser().resolve() if output_file else None
 
     if not input_path.is_file():
         raise FileNotFoundError(f"File {input_path} does not exist.")
@@ -180,51 +274,53 @@ def parse_nmap_xml(input_file: str | Path, output_file: str | Path) -> bool:
     seen = set()  # de-duplicate exact URLs while preserving order
 
     for host in root.findall('host'):
-        target = resolve_target(host)
-        if not target:
+        if not host_is_up(host):
+            logging.debug("Skipping host because its state is not up.")
+            continue
+
+        targets = resolve_targets(host, all_hostnames=all_hostnames)
+        if not targets:
             logging.debug("Failed to resolve target (IP or domain) for a host.")
             continue
 
         for port in host.findall('./ports/port'):
-            url = build_url(target, port)
-            if url and url not in seen:
-                seen.add(url)
-                extracted_urls.append(url)
+            for target in targets:
+                url = build_url(target, port)
+                if url and url not in seen:
+                    seen.add(url)
+                    extracted_urls.append(url)
 
     if not extracted_urls:
         logging.warning("No matching URLs were found.")
         return False
 
-    with output_path.open('w', encoding='utf-8') as handle:
-        for url in extracted_urls:
-            handle.write(url + '\n')
-    logging.info("URLs were written to %s", output_path)
+    extracted_urls.sort()
+    _write_urls(extracted_urls, output_path)
     return True
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Extract HTTP/HTTPS URLs from nmap XML.')
-    parser.add_argument('input_file', nargs='?', type=str, help='Input nmap XML file (legacy positional argument)')
-    parser.add_argument('output_file', nargs='?', type=str, help='Output file to write URLs (legacy positional argument)')
-    parser.add_argument('-i', '--input', dest='input_opt', type=str, help='Input nmap XML file')
-    parser.add_argument('-o', '--output', dest='output_opt', type=str, help='Output file to write URLs')
-    args = parser.parse_args(argv)
-
-    resolved_input = args.input_opt or args.input_file
-    resolved_output = args.output_opt or args.output_file
-    if not resolved_input or not resolved_output:
-        parser.error("Input and output are required (use positional args or -i/-o).")
-
-    args.input_file = resolved_input
-    args.output_file = resolved_output
-    return args
+    parser = create_argument_parser(description='Extract HTTP/HTTPS URLs from nmap XML.')
+    parser.add_argument('-i', '--input', required=True, type=str, help='Input nmap XML file')
+    parser.add_argument(
+        '-o',
+        '--output',
+        type=str,
+        help='Output file to write URLs (default: stdout)',
+    )
+    parser.add_argument(
+        '--all-hostnames',
+        action='store_true',
+        help='Generate URLs for every hostname in a host entry instead of only the first one.',
+    )
+    return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
 
     try:
-        parse_nmap_xml(args.input_file, args.output_file)
+        wrote_output = parse_nmap_xml(args.input, args.output, all_hostnames=args.all_hostnames)
     except FileNotFoundError as exc:
         logging.error("%s", exc)
         return 1
@@ -234,6 +330,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as exc:
         logging.error("I/O error: %s", exc)
         return 1
+
+    if not wrote_output:
+        return 2
 
     return 0
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 PROJECT_NAME = "simplescripts"
-VERSION = "0.1.0"
+VERSION = "1.0.1"
 SUMMARY = "Collection of offensive-security and utility scripts from the SimpleScripts repository."
 REQUIRES_PYTHON = ">=3.10"
 LICENSE = "MIT"
@@ -33,6 +33,7 @@ SCRIPT_SPECS = [
     ("AD/GPP_decrypt.py", "GPP_decrypt.py"),
     ("AD/LMHunter.py", "LMHunter.py"),
     ("AD/NTCreater.py", "NTCreater.py"),
+    ("AD/NTLMDecoder.py", "NTLMDecoder.py"),
     ("AD/PowerShellPayload.py", "PowerShellPayload.py"),
     ("AD/WeakPassHunter.py", "WeakPassHunter.py"),
     ("AD_PS/EncodeAssembly.ps1", "EncodeAssembly.ps1"),
@@ -42,6 +43,7 @@ SCRIPT_SPECS = [
     ("GetSomething/get_dns_by_file.py", "get_dns_by_file.py"),
     ("GetSomething/get_dns_by_ip.py", "get_dns_by_ip.py"),
     ("GetSomething/get_hash_by_opasswd.py", "get_hash_by_opasswd.py"),
+    ("GetSomething/get_ip_by_asn.py", "get_ip_by_asn.py"),
     ("GetSomething/get_ip-white_by_file.py", "get_ip-white_by_file.py"),
     ("GetSomething/get_ip_by_file.py", "get_ip_by_file.py"),
     ("GetSomething/get_net_by_ip.py", "get_net_by_ip.py"),
@@ -50,15 +52,16 @@ SCRIPT_SPECS = [
     ("Hunters/HeadersHunter.py", "HeadersHunter.py"),
     ("Hunters/WildcardHunter.py", "WildcardHunter.py"),
     ("Collectors/KatanaScan.py", "KatanaScan.py"),
+    ("Collectors/FFuFScan.py", "FFuFScan.py"),
     ("Mobile/PoC_Janus.py", "PoC_Janus.py"),
-    ("Mobile/get_deeplinks.py", "get_deeplinks.py"),
-    ("Mobile/get_exported_activities.py", "get_exported_activities.py"),
+    ("Mobile/android_deeplinks.py", "android_deeplinks.py"),
+    ("Mobile/android_activities.py", "android_activities.py"),
     ("Scanners/masscan_to_nmap.py", "masscan_to_nmap.py"),
     ("Scanners/masscan_to_url.py", "masscan_to_url.py"),
     ("Scanners/nmap_to_ip-port.py", "nmap_to_ip-port.py"),
     ("Scanners/nmap_to_url.py", "nmap_to_url.py"),
-    ("Assistants/maketask", "maketask"),
-    ("Linux/pivot_access_init.sh", "pivot_access_init.sh"),
+    ("Assistants/maketask.py", "maketask"),
+    ("Linux/ssh_persist.py", "ssh_persist.py"),
 ]
 SCRIPT_FILES = list(dict.fromkeys(source for source, _ in SCRIPT_SPECS))
 SDIST_FILES = [

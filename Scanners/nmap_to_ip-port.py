@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
-import xml.etree.ElementTree as ET
+"""Extract hosts and open ports from nmap XML output."""
+
 import argparse
 import logging
 import re
+import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Sequence
+
+
+def create_argument_parser(*args, **kwargs):
+    try:
+        return argparse.ArgumentParser(*args, color=False, **kwargs)
+    except TypeError:
+        return argparse.ArgumentParser(*args, **kwargs)
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 
-def is_https_service(service_element):
+def is_https_service(service_element: ET.Element | None) -> bool:
     """Return True when nmap service metadata indicates HTTPS or SSL-wrapped HTTP."""
     if service_element is None:
         return False
@@ -29,7 +39,8 @@ def is_https_service(service_element):
 
     return False
 
-def resolve_target(host):
+
+def resolve_target(host: ET.Element) -> str | None:
     """
     Return the hostname if present; otherwise return an IP address.
     When selecting an IP, prefer addrtype in this order: ipv4, then ipv6.
@@ -74,9 +85,32 @@ def resolve_target(host):
     return None
 
 
-def parse_nmap_xml(input_file: str | Path, output_file: str | Path, https_filter: bool) -> bool:
+def host_is_up(host: ET.Element) -> bool:
+    """Return True when the host is up or when status is absent."""
+    status = host.find("status")
+    if status is None:
+        return True
+    return (status.get("state") or "").lower() == "up"
+
+
+def _write_lines(lines_to_write: list[str], output_path: Path | None) -> None:
+    output_text = "".join(f"{line}\n" for line in lines_to_write)
+    if output_path is None:
+        sys.stdout.write(output_text)
+        return
+
+    with output_path.open('w', encoding='utf-8') as handle:
+        handle.write(output_text)
+    logging.info("Output written to %s", output_path)
+
+
+def parse_nmap_xml(
+    input_file: str | Path,
+    output_file: str | Path | None,
+    https_filter: bool,
+) -> bool:
     input_path = Path(input_file).expanduser().resolve()
-    output_path = Path(output_file).expanduser().resolve()
+    output_path = Path(output_file).expanduser().resolve() if output_file else None
 
     if not input_path.is_file():
         raise FileNotFoundError(f"File {input_path} does not exist.")
@@ -87,6 +121,10 @@ def parse_nmap_xml(input_file: str | Path, output_file: str | Path, https_filter
     lines_to_write = []
 
     for host in root.findall('host'):
+        if not host_is_up(host):
+            logging.debug("Skipping host because its state is not up.")
+            continue
+
         target = resolve_target(host)
         if not target:
             logging.debug("Failed to determine domain or IP for a host.")
@@ -125,17 +163,14 @@ def parse_nmap_xml(input_file: str | Path, output_file: str | Path, https_filter
         logging.warning("No open ports or targets found for output.")
         return False
 
-    with output_path.open('w', encoding='utf-8') as handle:
-        for line in lines_to_write:
-            handle.write(line + '\n')
-    logging.info("Output written to %s", output_path)
+    _write_lines(lines_to_write, output_path)
     return True
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Nmap XML parser to extract domain/IP and open ports.')
+    parser = create_argument_parser(description='Nmap XML parser to extract domain/IP and open ports.')
     parser.add_argument('-i', '--input', required=True, type=str, help='Input XML file')
-    parser.add_argument('-o', '--output', required=True, type=str, help='Output file')
+    parser.add_argument('-o', '--output', type=str, help='Output file (default: stdout)')
     parser.add_argument('--https', action='store_true', help='Output only ports with https service')
     return parser.parse_args(argv)
 
@@ -144,7 +179,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
 
     try:
-        parse_nmap_xml(args.input, args.output, args.https)
+        wrote_output = parse_nmap_xml(args.input, args.output, args.https)
     except FileNotFoundError as exc:
         logging.error("%s", exc)
         return 1
@@ -154,6 +189,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as exc:
         logging.error("I/O error: %s", exc)
         return 1
+
+    if not wrote_output:
+        return 2
 
     return 0
 

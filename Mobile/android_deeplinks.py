@@ -19,6 +19,13 @@ from itertools import product
 from pathlib import Path
 from typing import Final, Iterable, Sequence
 
+
+def create_argument_parser(*args, **kwargs) -> argparse.ArgumentParser:
+    try:
+        return argparse.ArgumentParser(*args, color=False, **kwargs)
+    except TypeError:
+        return argparse.ArgumentParser(*args, **kwargs)
+
 ANDROID_NS: Final = "http://schemas.android.com/apk/res/android"
 NS = {"android": ANDROID_NS}
 LOGGER = logging.getLogger("deeplink_analyzer")
@@ -39,6 +46,7 @@ def _auto() -> frozenset[str]:
 class IntentFilterData:
     schemes: frozenset[str] = field(default_factory=_auto)
     hosts: frozenset[str] = field(default_factory=_auto)
+    ports: frozenset[str] = field(default_factory=_auto)
     paths: frozenset[str] = field(default_factory=_auto)
 
 
@@ -60,23 +68,30 @@ class DeepLinkGenerator:
         )
 
     def collect(self, intent: ET.Element) -> IntentFilterData:
-        schemes, hosts, paths = set[str](), set[str](), set[str]()
+        schemes, hosts, ports, paths = set[str](), set[str](), set[str](), set[str]()
         for data in intent.findall("data"):
             if s := (data.get(f"{{{ANDROID_NS}}}scheme") or "").lower():
                 schemes.add(s)
             if h := data.get(f"{{{ANDROID_NS}}}host"):
                 hosts.add(h.strip())
+            if port := (data.get(f"{{{ANDROID_NS}}}port") or "").strip():
+                ports.add(port)
             if p := self._extract_path(data):
                 paths.add(p)
-        return IntentFilterData(frozenset(schemes), frozenset(hosts), frozenset(paths))
+        return IntentFilterData(
+            frozenset(schemes),
+            frozenset(hosts),
+            frozenset(ports),
+            frozenset(paths),
+        )
 
     def generate(self, data: IntentFilterData) -> frozenset[str]:
         links: set[str] = set()
         for scheme in data.schemes:
-            hosts = self._valid_hosts(scheme, data.hosts)
+            authorities = self._valid_authorities(scheme, data.hosts, data.ports)
             paths = data.paths or {""}
-            for host, path in product(hosts or [None], paths):
-                links.add(self._build(scheme, host, path))
+            for authority, path in product(authorities or [None], paths):
+                links.add(self._build(scheme, authority, path))
         LOGGER.debug("%d links for schemes %s", len(links), ",".join(data.schemes))
         return frozenset(links)
 
@@ -86,15 +101,34 @@ class DeepLinkGenerator:
                 return self._format_path(val)
         return None
 
-    def _valid_hosts(self, scheme: str, hosts: frozenset[str]) -> frozenset[str]:
-        if scheme in self.HTTP_SCHEMES:
-            return hosts or frozenset({""})
-        return hosts or frozenset({""})
+    def _valid_authorities(
+        self,
+        scheme: str,
+        hosts: frozenset[str],
+        ports: frozenset[str],
+    ) -> frozenset[str]:
+        _ = scheme
+        normalized_hosts = hosts or frozenset({""})
+        authorities: set[str] = set()
+        for host in normalized_hosts:
+            formatted_host = self._format_host(host)
+            if not formatted_host or not ports:
+                authorities.add(formatted_host)
+                continue
+            for port in ports:
+                authorities.add(f"{formatted_host}:{port}")
+        return frozenset(authorities)
 
     @staticmethod
-    def _build(scheme: str, host: str | None, path: str) -> str:
-        host_part = host or ""
-        base = f"{scheme}://{host_part}"
+    def _format_host(host: str) -> str:
+        if ":" in host and not host.startswith("[") and not host.endswith("]"):
+            return f"[{host}]"
+        return host
+
+    @staticmethod
+    def _build(scheme: str, authority: str | None, path: str) -> str:
+        authority_part = authority or ""
+        base = f"{scheme}://{authority_part}"
         if path:
             return f"{base}{path}"
         return base
@@ -142,7 +176,7 @@ class DeepLinkAnalyzer:
 
 
 def _arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = create_argument_parser(
         prog="deeplink-analyzer",
         description="Extract deep links from AndroidManifest.xml",
     )
@@ -153,27 +187,27 @@ def _arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _setup_log(debug: bool):
+def _setup_log(debug: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if debug else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
 
 
-def _print_links_only(results: list[ComponentDeepLinks]):
+def _print_links_only(results: list[ComponentDeepLinks]) -> None:
     unique = {link for entry in results for link in entry.links}
     for link in sorted(unique):
         print(link)
 
 
-def _print_report(results: list[ComponentDeepLinks]):
+def _print_report(results: list[ComponentDeepLinks]) -> None:
     for entry in results:
         print(f"\n[{entry.tag}] {entry.name}")
         for index, link in enumerate(sorted(entry.links), 1):
             print(f"{index:>3}. {link}")
 
 
-def main(argv: list[str] | None = None):
+def main(argv: list[str] | None = None) -> int:
     args = _arg_parser().parse_args(argv)
     _setup_log(args.debug)
 
@@ -184,10 +218,11 @@ def main(argv: list[str] | None = None):
             _print_links_only(results)
         else:
             _print_report(results)
+        return 0
     except (FileNotFoundError, ET.ParseError, OSError, ValueError) as exc:
-        LOGGER.error("%s", exc)
-        sys.exit(1)
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    raise SystemExit(main())

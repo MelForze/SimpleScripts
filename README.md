@@ -23,17 +23,15 @@ For local development / local checkout:
 pipx install .
 ```
 
-This installs the repository scripts into your `pipx` bin directory, so you can run tools such as `DBeaverdecrypt.py`, `HeadersHunter.py`, `masscan_to_url.py`, `maketask`, or `pivot_access_init.sh` directly from your shell.
-
 ## To Do
 
 - [x] **Create Wildcard Hunter Script**  
   Develop a script to search for wildcard certificates, streamlining the process of certificate discovery and verification.
 
-- [ ] **Create Linpeas/Winpeas Everywhere Script**  
+- [ ] **Create Privesc Script**  
   Build a script that deploys Linpeas on multiple systems to streamline system auditing and security checks.
 
-- [ ] **Ansible OSINT script**
+- [ ] **OSINT script**
   Develop a script that will automate the entire OSINT process including:
   - [ ] Shodan
   - [ ] Censys
@@ -46,7 +44,7 @@ This installs the repository scripts into your `pipx` bin directory, so you can 
   - [ ] SSL Ciphers
   - [ ] Nmap/Masscan
   - [ ] Nuclei
-  - [ ] Httpx
+  - [ ] httpx
   - [ ] Metaforge
   - [ ] Anything else?
 

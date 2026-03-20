@@ -17,9 +17,37 @@ PASSWORD_DECRYPTION_KEY = bytes(
     [186, 187, 74, 159, 119, 74, 184, 83, 201, 108, 45, 101, 61, 254, 84, 74]
 )
 
+RED = "\033[31m"
+BLUE = "\033[34m"
+RESET = "\033[0m"
+
+
+def create_argument_parser(*args, **kwargs):
+    try:
+        return argparse.ArgumentParser(*args, color=False, **kwargs)
+    except TypeError:
+        return argparse.ArgumentParser(*args, **kwargs)
+
+
+def print_banner():
+    lines = [
+        f"{RED} ____  ____                              ____                           _   {RESET}",
+        f"{BLUE}|  _ \\| __ )  ___  __ ___   _____ _ __  |  _ \\  ___  ___ _ __ _   _ _ __| |_ {RESET}",
+        f"{RED}| | | |  _ \\ / _ \\/ _` \\ \\ / / _ \\ '__| | | | |/ _ \\/ __| '__| | | | '_ \\ __|{RESET}",
+        f"{BLUE}| |_| | |_) |  __/ (_| |\\ V /  __/ |    | |_| |  __/ (__| |  | |_| | |_) | |_ {RESET}",
+        f"{RED}|____/|____/ \\___|\\__,_| \\_/ \\___|_|    |____/ \\___|\\___|_|   \\__, | .__/ \\__|{RESET}",
+        f"{BLUE}                                                            |___/|_|          {RESET}",
+    ]
+    for line in lines:
+        print(line)
+
+    print(
+        "\nDecrypt saved DBeaver credentials from credentials-config.json.\n"
+    )
+
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
+    parser = create_argument_parser(
         description="Decrypt DBeaver credentials-config.json."
     )
     parser.add_argument(
@@ -115,7 +143,7 @@ def main(argv=None):
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    print(filepath)
+    print_banner()
     print(format_output(plaintext))
     return 0
 
