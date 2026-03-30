@@ -30,7 +30,7 @@ LAUNCHER_MODULE = "simplescripts_launcher.py"
 SCRIPT_SPECS = [
     ("AD/DBeaverdecrypt.py", "DBeaverdecrypt.py"),
     ("AD/DomainSid-Hex.py", "DomainSid-Hex.py"),
-    ("AD/GPP_decrypt.py", "GPP_decrypt.py"),
+    ("AD/gpp_decrypt.py", "GPP_decrypt.py"),
     ("AD/LMHunter.py", "LMHunter.py"),
     ("AD/NTCreater.py", "NTCreater.py"),
     ("AD/NTLMDecoder.py", "NTLMDecoder.py"),
