@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract unique open TCP/UDP ports and generate matching nmap commands."""
+"""Extract unique open TCP ports and generate an httpx command."""
 
 import argparse
 import logging
@@ -21,6 +21,12 @@ logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 RE_DISCOVERED = re.compile(r"Discovered open port (\d+)/(\w+) on ", re.IGNORECASE)
 RE_LIST = re.compile(r"^open\s+(\w+)\s+(\d+)\s+", re.IGNORECASE)
+HTTPX_COMMAND_TEMPLATE = (
+    "httpx -l scope.txt -sc -cl -ct -location -hash md5 -rt -lc -wc -title -server -td "
+    "-method -ws -ip -cname -cdn -ss -sid 10 -t 100 -rl 300 -pa -p PORTS -pipeline -http2 "
+    "-vhost -o ./httpx/httpx_result -oa -srd ./httpx/ -random-agent -auto-referer -fr -stats "
+    "-timeout 30"
+)
 CLIPBOARD_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("pbcopy",),
     ("wl-copy",),
@@ -42,7 +48,7 @@ def setup_logging(verbose: bool) -> None:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = create_argument_parser(
-        description="Extract unique open TCP/UDP ports and generate matching nmap commands."
+        description="Extract unique open TCP ports and generate an httpx command."
     )
     parser.add_argument(
         'file',
@@ -70,86 +76,62 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _extract_port_from_line(line: str) -> tuple[str, int] | None:
-    discovered_match = RE_DISCOVERED.search(line)
-    if discovered_match:
-        return discovered_match.group(2).lower(), int(discovered_match.group(1))
-
-    list_match = RE_LIST.search(line)
-    if list_match:
-        return list_match.group(1).lower(), int(list_match.group(2))
-
-    return None
-
-
 def _iter_lines(file_path: Path) -> Iterable[str]:
     with file_path.open('r', encoding='utf-8', errors='ignore') as handle:
         for line in handle:
             yield line.rstrip('\n')
 
 
-def extract_ports(file_path: str | Path) -> dict[str, set[int]]:
-    """
-    Read the file and collect unique TCP/UDP ports from known masscan output formats.
-    """
+def _extract_tcp_port_from_line(line: str) -> int | None:
+    discovered_match = RE_DISCOVERED.search(line)
+    if discovered_match:
+        protocol = discovered_match.group(2).lower()
+        if protocol != "tcp":
+            return None
+        return int(discovered_match.group(1))
+
+    list_match = RE_LIST.search(line)
+    if list_match:
+        protocol = list_match.group(1).lower()
+        if protocol != "tcp":
+            return None
+        return int(list_match.group(2))
+
+    return None
+
+
+def extract_tcp_ports(file_path: str | Path) -> set[int]:
+    """Read file and collect unique TCP ports from known masscan formats."""
     path = Path(file_path)
-    ports_by_protocol: dict[str, set[int]] = {"tcp": set(), "udp": set()}
+    tcp_ports: set[int] = set()
 
     for line in _iter_lines(path):
         if not line or line.startswith("#"):
             continue
 
         try:
-            result = _extract_port_from_line(line)
+            port = _extract_tcp_port_from_line(line)
         except ValueError:
             logging.warning("Skipping invalid line: %r", line)
             continue
 
-        if result is None:
-            continue
-        protocol, port = result
-        if protocol not in ports_by_protocol:
-            logging.debug("Skipping unsupported protocol %r in line: %r", protocol, line)
+        if port is None:
             continue
         if not (1 <= port <= 65535):
             logging.warning("Skipping out-of-range port: %s", port)
             continue
 
-        ports_by_protocol[protocol].add(port)
-        logging.debug("Found open %s port: %s", protocol, port)
+        tcp_ports.add(port)
+        logging.debug("Found open tcp port: %s", port)
 
-    return ports_by_protocol
+    return tcp_ports
 
 
-def generate_command(protocol: str, ports: set[int]) -> str:
-    """Generate one nmap command for the given protocol and port list."""
-    sorted_ports = sorted(ports)
+def generate_command(tcp_ports: set[int]) -> str:
+    """Generate httpx command with substituted and sorted TCP ports."""
+    sorted_ports = sorted(tcp_ports)
     ports_str = ",".join(map(str, sorted_ports))
-
-    if protocol == "udp":
-        return (
-            "sudo nmap -Pn -n -sUV --version-all --open "
-            f"-p {ports_str} -v --webxml -oA nmap/nmap_result_udp -iL domains.txt"
-        )
-
-    return (
-        "sudo nmap -Pn -n -sSV --version-all --open "
-        f"-p {ports_str} --min-rate 4999 --max-rate 5000 --max-retries 1 "
-        "--min-rtt-timeout 50ms --max-rtt-timeout 150ms "
-        "-v --webxml -oA nmap/nmap_result -iL domains.txt"
-    )
-
-
-def format_commands_output(tcp_ports: set[int], udp_ports: set[int]) -> str:
-    """Render generated commands in a readable, stable text format."""
-    sections: list[str] = []
-
-    if tcp_ports:
-        sections.append(f"TCP Command:\n{generate_command('tcp', tcp_ports)}")
-    if udp_ports:
-        sections.append(f"UDP Command:\n{generate_command('udp', udp_ports)}")
-
-    return "\n\n".join(sections)
+    return HTTPX_COMMAND_TEMPLATE.replace("PORTS", ports_str)
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -178,11 +160,11 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
-def render_commands_with_copy_status(commands_output: str, copied: bool) -> str:
+def render_command_with_copy_status(command: str, copied: bool) -> str:
     """Prepend a green success line when clipboard copy succeeds."""
     if not copied:
-        return commands_output
-    return f"{COPY_SUCCESS_MESSAGE}\n{commands_output}"
+        return command
+    return f"{COPY_SUCCESS_MESSAGE}\n{command}"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -195,26 +177,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     try:
-        ports_by_protocol = extract_ports(file_path)
+        tcp_ports = extract_tcp_ports(file_path)
     except OSError as exc:
         logging.error("I/O error while reading %s: %s", file_path, exc)
         return 1
 
-    tcp_ports = ports_by_protocol["tcp"]
-    udp_ports = ports_by_protocol["udp"]
-    if not tcp_ports and not udp_ports:
-        logging.warning("No open TCP or UDP ports found.")
+    if not tcp_ports:
+        logging.warning("No open TCP ports found.")
         return 0
 
-    commands_output = format_commands_output(tcp_ports, udp_ports)
-    copied = copy_to_clipboard(commands_output)
+    command = generate_command(tcp_ports)
+    copied = copy_to_clipboard(command)
     if not copied:
         logging.warning(
             "Could not copy command to clipboard. Install pbcopy, wl-copy, xclip, xsel, or clip."
         )
 
-    print(render_commands_with_copy_status(commands_output, copied))
+    print(render_command_with_copy_status(command, copied))
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

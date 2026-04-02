@@ -30,7 +30,7 @@ LAUNCHER_MODULE = "simplescripts_launcher.py"
 SCRIPT_SPECS = [
     ("AD/DBeaverdecrypt.py", "DBeaverdecrypt.py"),
     ("AD/DomainSid-Hex.py", "DomainSid-Hex.py"),
-    ("AD/gpp_decrypt.py", "GPP_decrypt.py"),
+    ("AD/GPP_decrypt.py", "GPP_decrypt.py"),
     ("AD/LMHunter.py", "LMHunter.py"),
     ("AD/NTCreater.py", "NTCreater.py"),
     ("AD/NTLMDecoder.py", "NTLMDecoder.py"),
@@ -57,6 +57,7 @@ SCRIPT_SPECS = [
     ("Mobile/android_deeplinks.py", "android_deeplinks.py"),
     ("Mobile/android_activities.py", "android_activities.py"),
     ("Scanners/masscan_to_nmap.py", "masscan_to_nmap.py"),
+    ("Scanners/masscan_to_httpx.py", "masscan_to_httpx.py"),
     ("Scanners/masscan_to_url.py", "masscan_to_url.py"),
     ("Scanners/nmap_to_ip-port.py", "nmap_to_ip-port.py"),
     ("Scanners/nmap_to_url.py", "nmap_to_url.py"),
