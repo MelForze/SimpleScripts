@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 import tarfile
 import zipfile
 from pathlib import Path
 
 
 PROJECT_NAME = "simplescripts"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 SUMMARY = "Collection of offensive-security and utility scripts from the SimpleScripts repository."
 REQUIRES_PYTHON = ">=3.10"
 LICENSE = "MIT"
@@ -30,7 +31,7 @@ LAUNCHER_MODULE = "simplescripts_launcher.py"
 SCRIPT_SPECS = [
     ("AD/DBeaverdecrypt.py", "DBeaverdecrypt.py"),
     ("AD/DomainSid-Hex.py", "DomainSid-Hex.py"),
-    ("AD/GPP_decrypt.py", "GPP_decrypt.py"),
+    ("AD/gpp_decrypt.py", "GPP_decrypt.py"),
     ("AD/LMHunter.py", "LMHunter.py"),
     ("AD/NTCreater.py", "NTCreater.py"),
     ("AD/NTLMDecoder.py", "NTLMDecoder.py"),
@@ -73,6 +74,7 @@ SDIST_FILES = [
     "pyproject.toml",
     *SCRIPT_FILES,
 ]
+PYPROJECT_VERSION_RE = re.compile(r'^\s*version\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
 
 
 def _metadata_text() -> str:
@@ -209,13 +211,38 @@ def _build_record(rows: list[tuple[str, str, str]]) -> bytes:
 
 
 def _validate_script_sources() -> None:
+    def has_exact_case(relative_path: str) -> bool:
+        current = ROOT
+        for part in Path(relative_path).parts:
+            try:
+                child_names = {child.name for child in current.iterdir()}
+            except OSError:
+                return False
+            if part not in child_names:
+                return False
+            current = current / part
+        return current.is_file()
+
     missing_sources = [
-        source for source in SCRIPT_FILES if not (ROOT / source).is_file()
+        source for source in SCRIPT_FILES if not has_exact_case(source)
     ]
     if missing_sources:
         raise FileNotFoundError(
             "Missing script sources for packaging: "
             + ", ".join(sorted(missing_sources))
+        )
+
+
+def _validate_project_version_sync() -> None:
+    pyproject_text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = PYPROJECT_VERSION_RE.search(pyproject_text)
+    if match is None:
+        raise ValueError("Could not read version from pyproject.toml")
+    pyproject_version = match.group(1)
+    if pyproject_version != VERSION:
+        raise ValueError(
+            "Version mismatch: pyproject.toml has "
+            f"{pyproject_version}, packaging backend has {VERSION}"
         )
 
 
@@ -228,6 +255,7 @@ def get_requires_for_build_sdist(config_settings=None):
 
 
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+    _validate_project_version_sync()
     metadata_root = Path(metadata_directory)
     dist_info = metadata_root / DIST_INFO_DIRNAME
     dist_info.mkdir(parents=True, exist_ok=True)
@@ -238,6 +266,7 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    _validate_project_version_sync()
     _validate_script_sources()
     wheel_dir = Path(wheel_directory)
     wheel_dir.mkdir(parents=True, exist_ok=True)
@@ -270,6 +299,7 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 
 
 def build_sdist(sdist_directory, config_settings=None):
+    _validate_project_version_sync()
     _validate_script_sources()
     sdist_dir = Path(sdist_directory)
     sdist_dir.mkdir(parents=True, exist_ok=True)
