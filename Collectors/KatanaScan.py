@@ -189,6 +189,47 @@ def run_katana(
             temp.unlink()
 
 
+def run_katana_dast(
+    url: str,
+    use_headless: bool,
+) -> tuple[bool, list[str]]:
+    """Run katana for one URL in JSONL mode and return raw non-empty lines."""
+    print(f"[+] dast: crawling {url}")
+
+    cmd = ["katana", "-u", url] + KATANA_BASE_OPTS.copy()
+    cmd[cmd.index("-crawl-scope") + 1] = url
+    cmd += ["-jsonl", "-aff", "-iqp"]
+    if use_headless:
+        cmd.append("-headless")
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        print(f"[!] Error in dast for {url}: {exc}", file=sys.stderr)
+        return False, []
+
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    return True, lines
+
+
+def dedupe_preserve_order(lines: list[str]) -> list[str]:
+    """Return deduplicated lines while preserving first-seen order."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for line in lines:
+        if line in seen:
+            continue
+        seen.add(line)
+        ordered.append(line)
+    return ordered
+
+
 def merge_origin_results(mode: str, seed_urls: list[str], seed_results: list[list[str]]) -> list[str]:
     """Merge multiple katana runs for a single origin into one deduplicated output."""
     merged: set[str] = set()
@@ -211,7 +252,10 @@ def write_origin_results(origin: str, out_dir: Path, lines: list[str]) -> Path:
 def parse_args(argv=None) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = create_argument_parser(
-        description="Run katana in selected modes: all, files, paths."
+        description=(
+            "Run katana in selected modes (all/files/paths) or in --dast mode "
+            "that writes a single katana-dast.jsonl file."
+        )
     )
     parser.add_argument(
         "-i",
@@ -233,7 +277,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         dest="modes",
         action="append",
         choices=VISIBLE_MODES,
-        help="Crawl mode to run. Use 'everything' for all, files, and paths. Repeat the flag if needed.",
+        help=(
+            "Crawl mode to run. Use 'everything' for all, files, and paths. "
+            "Repeat the flag if needed. Required unless --dast is used."
+        ),
+    )
+    parser.add_argument(
+        "--dast",
+        action="store_true",
+        help="Run DAST mode and write a single katana-dast.jsonl file. Cannot be used with -m/--mode.",
     )
     parser.add_argument(
         "-b",
@@ -269,10 +321,16 @@ def main(argv=None) -> int:
         print(f"[!] URL file not found: {args.input}", file=sys.stderr)
         return 1
 
-    selected_modes = resolve_selected_modes(args)
-    if not selected_modes:
-        print("[!] Please specify at least one crawl mode with -m/--mode.", file=sys.stderr)
+    if args.dast and args.modes:
+        print("[!] --dast cannot be combined with -m/--mode.", file=sys.stderr)
         return 1
+
+    selected_modes: list[str] = []
+    if not args.dast:
+        selected_modes = resolve_selected_modes(args)
+        if not selected_modes:
+            print("[!] Please specify at least one crawl mode with -m/--mode.", file=sys.stderr)
+            return 1
 
     try:
         urls = read_input_urls(args.input)
@@ -285,6 +343,37 @@ def main(argv=None) -> int:
         return 1
 
     output_root = args.output_dir
+
+    if args.dast:
+        output_root.mkdir(parents=True, exist_ok=True)
+        dast_lines: list[str] = []
+        failures: list[str] = []
+
+        for url in urls:
+            success, lines = run_katana_dast(
+                url=url,
+                use_headless=args.browser,
+            )
+            if not success:
+                failures.append(url)
+                continue
+            dast_lines.extend(lines)
+
+        final_lines = dedupe_preserve_order(dast_lines)
+        dast_output = output_root / "katana-dast.jsonl"
+        dast_output.write_text(
+            "\n".join(final_lines) + ("\n" if final_lines else ""),
+            encoding="utf-8",
+        )
+
+        if failures:
+            print(f"[!] Katana failed for {len(failures)} target(s) in dast mode.", file=sys.stderr)
+            for url in failures:
+                print(f"    - {url}", file=sys.stderr)
+            return 1
+
+        return 0
+
     failures: list[tuple[str, str]] = []
     grouped_urls = group_urls_by_origin(urls)
 
