@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -15,6 +16,7 @@ MODE_CONFIG: dict[str, dict[str, list[str] | str]] = {
 }
 VISIBLE_MODES = ("all", "files", "paths", "everything")
 SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+HTTP_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 
 KATANA_BASE_OPTS = [
     "-d",
@@ -230,6 +232,67 @@ def dedupe_preserve_order(lines: list[str]) -> list[str]:
     return ordered
 
 
+def find_first_url(value) -> str | None:
+    """Recursively find the first URL-like value in a JSON-compatible object."""
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate.startswith("http://") or candidate.startswith("https://"):
+            return candidate
+        match = HTTP_URL_RE.search(candidate)
+        return match.group(0) if match else None
+
+    if isinstance(value, dict):
+        for nested in value.values():
+            found = find_first_url(nested)
+            if found:
+                return found
+        return None
+
+    if isinstance(value, list):
+        for nested in value:
+            found = find_first_url(nested)
+            if found:
+                return found
+        return None
+
+    return None
+
+
+def has_same_origin(candidate_url: str, expected_origin: str) -> bool:
+    """Check whether candidate URL belongs to the expected normalized origin."""
+    try:
+        return origin_from_url(candidate_url) == expected_origin
+    except ValueError:
+        return False
+
+
+def filter_lines_to_origin(lines: list[str], expected_origin: str) -> list[str]:
+    """Filter plain URL lines to the expected origin."""
+    return [line for line in lines if has_same_origin(line, expected_origin)]
+
+
+def filter_dast_lines_to_origin(lines: list[str], expected_origin: str) -> list[str]:
+    """Filter raw katana JSONL lines by the first URL found in each JSON record."""
+    filtered: list[str] = []
+    for line in lines:
+        candidate_url: str | None = None
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            payload = None
+
+        if payload is not None:
+            candidate_url = find_first_url(payload)
+        if not candidate_url:
+            fallback = HTTP_URL_RE.search(line)
+            if fallback:
+                candidate_url = fallback.group(0)
+
+        if candidate_url and has_same_origin(candidate_url, expected_origin):
+            filtered.append(line)
+    return filtered
+
+
 def merge_origin_results(mode: str, seed_urls: list[str], seed_results: list[list[str]]) -> list[str]:
     """Merge multiple katana runs for a single origin into one deduplicated output."""
     merged: set[str] = set()
@@ -286,6 +349,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--dast",
         action="store_true",
         help="Run DAST mode and write a single katana-dast.jsonl file. Cannot be used with -m/--mode.",
+    )
+    parser.add_argument(
+        "--same-origin-only",
+        action="store_true",
+        help="Keep only results that match the origin of each input URL.",
     )
     parser.add_argument(
         "-b",
@@ -357,6 +425,8 @@ def main(argv=None) -> int:
             if not success:
                 failures.append(url)
                 continue
+            if args.same_origin_only:
+                lines = filter_dast_lines_to_origin(lines, origin_from_url(url))
             dast_lines.extend(lines)
 
         final_lines = dedupe_preserve_order(dast_lines)
@@ -397,6 +467,7 @@ def main(argv=None) -> int:
                 if not success:
                     failures.append((url, mode))
                     continue
+                lines = filter_lines_to_origin(lines, origin)
                 seed_results.append(lines)
 
             if seed_results:
