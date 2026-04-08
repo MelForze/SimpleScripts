@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import re
 import subprocess
@@ -163,6 +164,8 @@ def run_katana(
     out_dir: Path,
     extra_opts: list[str],
     use_headless: bool,
+    proxy: str | None = None,
+    headers: list[str] | None = None,
 ) -> tuple[bool, list[str]]:
     """Run katana for one URL/mode pair and return deduplicated result lines."""
     safe = sanitize_filename(url)
@@ -170,11 +173,13 @@ def run_katana(
 
     print(f"[+] {out_dir.name}: crawling {url}")
 
-    cmd = ["katana", "-u", url] + KATANA_BASE_OPTS.copy()
-    cmd[cmd.index("-crawl-scope") + 1] = url
-    if use_headless:
-        cmd.append("-headless")
-    cmd += extra_opts
+    cmd = build_katana_command(
+        url=url,
+        use_headless=use_headless,
+        proxy=proxy,
+        headers=headers,
+        extra_opts=extra_opts,
+    )
 
     try:
         with temp.open("w", encoding="utf-8") as temp_handle:
@@ -192,15 +197,19 @@ def run_katana(
 def run_katana_dast(
     url: str,
     use_headless: bool,
+    proxy: str | None = None,
+    headers: list[str] | None = None,
 ) -> tuple[bool, list[str]]:
     """Run katana for one URL in JSONL mode and return raw non-empty lines."""
     print(f"[+] dast: crawling {url}")
 
-    cmd = ["katana", "-u", url] + KATANA_BASE_OPTS.copy()
-    cmd[cmd.index("-crawl-scope") + 1] = url
-    cmd += ["-jsonl", "-aff", "-iqp"]
-    if use_headless:
-        cmd.append("-headless")
+    cmd = build_katana_command(
+        url=url,
+        use_headless=use_headless,
+        proxy=proxy,
+        headers=headers,
+        is_dast=True,
+    )
 
     try:
         proc = subprocess.run(
@@ -228,6 +237,36 @@ def dedupe_preserve_order(lines: list[str]) -> list[str]:
         seen.add(line)
         ordered.append(line)
     return ordered
+
+
+def build_katana_command(
+    url: str,
+    use_headless: bool,
+    proxy: str | None = None,
+    headers: list[str] | None = None,
+    extra_opts: list[str] | None = None,
+    is_dast: bool = False,
+) -> list[str]:
+    """Build a katana command with shared options for normal and DAST runs."""
+    cmd = ["katana", "-u", url] + KATANA_BASE_OPTS.copy()
+    cmd[cmd.index("-crawl-scope") + 1] = url
+
+    if proxy:
+        cmd += ["-proxy", proxy]
+
+    for header in headers or []:
+        cmd += ["-H", header]
+
+    if is_dast:
+        cmd += ["-jsonl", "-aff", "-iqp"]
+
+    if use_headless:
+        cmd.append("-headless")
+
+    if extra_opts:
+        cmd += extra_opts
+
+    return cmd
 
 
 def has_same_origin(candidate_url: str, expected_origin: str) -> bool:
@@ -301,6 +340,30 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Run DAST mode and write a single katana-dast.jsonl file. Cannot be used with -m/--mode.",
     )
     parser.add_argument(
+        "--dast-output",
+        type=Path,
+        default=None,
+        help="Output file for --dast mode. Default: <output-dir>/katana-dast.jsonl",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Maximum number of concurrent katana processes. Default: 4",
+    )
+    parser.add_argument(
+        "--proxy",
+        type=str,
+        default=None,
+        help="Proxy to pass to katana -proxy, for example: http://127.0.0.1:8080",
+    )
+    parser.add_argument(
+        "--header",
+        dest="headers",
+        action="append",
+        help='Additional request header, repeat as needed. Example: --header "Authorization: Bearer XXX"',
+    )
+    parser.add_argument(
         "-b",
         "--browser",
         action="store_true",
@@ -329,13 +392,24 @@ def resolve_selected_modes(args: argparse.Namespace) -> list[str]:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    args.output_dir = Path(str(args.output_dir)).expanduser()
+    if args.dast_output is not None:
+        args.dast_output = Path(str(args.dast_output)).expanduser()
 
     if not args.input.is_file():
         print(f"[!] URL file not found: {args.input}", file=sys.stderr)
         return 1
 
+    if args.workers < 1:
+        print("[!] --workers must be at least 1.", file=sys.stderr)
+        return 1
+
     if args.dast and args.modes:
         print("[!] --dast cannot be combined with -m/--mode.", file=sys.stderr)
+        return 1
+
+    if args.dast_output is not None and not args.dast:
+        print("[!] --dast-output can only be used with --dast.", file=sys.stderr)
         return 1
 
     selected_modes: list[str] = []
@@ -358,22 +432,41 @@ def main(argv=None) -> int:
     output_root = args.output_dir
 
     if args.dast:
-        output_root.mkdir(parents=True, exist_ok=True)
-        dast_lines: list[str] = []
-        failures: list[str] = []
+        if args.dast_output is None:
+            output_root.mkdir(parents=True, exist_ok=True)
+            dast_output = output_root / "katana-dast.jsonl"
+        else:
+            dast_output = args.dast_output
 
-        for url in urls:
-            success, lines = run_katana_dast(
-                url=url,
-                use_headless=args.browser,
-            )
-            if not success:
-                failures.append(url)
-                continue
-            dast_lines.extend(lines)
+        dast_output.parent.mkdir(parents=True, exist_ok=True)
+        failures: list[str] = []
+        indexed_results: dict[int, list[str]] = {}
+
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_to_item = {
+                executor.submit(
+                    run_katana_dast,
+                    url=url,
+                    use_headless=args.browser,
+                    proxy=args.proxy,
+                    headers=args.headers,
+                ): (idx, url)
+                for idx, url in enumerate(urls)
+            }
+
+            for future in as_completed(future_to_item):
+                idx, url = future_to_item[future]
+                success, lines = future.result()
+                if not success:
+                    failures.append(url)
+                    continue
+                indexed_results[idx] = lines
+
+        dast_lines: list[str] = []
+        for idx in range(len(urls)):
+            dast_lines.extend(indexed_results.get(idx, []))
 
         final_lines = dedupe_preserve_order(dast_lines)
-        dast_output = output_root / "katana-dast.jsonl"
         dast_output.write_text(
             "\n".join(final_lines) + ("\n" if final_lines else ""),
             encoding="utf-8",
@@ -389,6 +482,11 @@ def main(argv=None) -> int:
 
     failures: list[tuple[str, str]] = []
     grouped_urls = group_urls_by_origin(urls)
+    tasks: list[tuple[str, str, str, Path, list[str]]] = []
+    group_seed_urls: dict[tuple[str, str], list[str]] = {}
+    group_mode_dirs: dict[tuple[str, str], Path] = {}
+    group_remaining: dict[tuple[str, str], int] = {}
+    group_results: dict[tuple[str, str], list[list[str]]] = {}
 
     for mode in selected_modes:
         mode_dir = output_root / str(MODE_CONFIG[mode]["directory"])
@@ -398,25 +496,49 @@ def main(argv=None) -> int:
         for mode in selected_modes:
             mode_dir = output_root / str(MODE_CONFIG[mode]["directory"])
             extra_opts = list(MODE_CONFIG[mode]["extra_opts"])
-            seed_results: list[list[str]] = []
-
+            group_key = (mode, origin)
+            group_seed_urls[group_key] = seed_urls
+            group_mode_dirs[group_key] = mode_dir
+            group_remaining[group_key] = len(seed_urls)
+            group_results[group_key] = []
             for url in seed_urls:
-                success, lines = run_katana(
-                    url=url,
-                    out_dir=mode_dir,
-                    extra_opts=extra_opts,
-                    use_headless=args.browser,
-                )
-                if not success:
-                    failures.append((url, mode))
-                    continue
+                tasks.append((mode, origin, url, mode_dir, extra_opts))
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        future_to_item = {
+            executor.submit(
+                run_katana,
+                url=url,
+                out_dir=mode_dir,
+                extra_opts=extra_opts,
+                use_headless=args.browser,
+                proxy=args.proxy,
+                headers=args.headers,
+            ): (mode, origin, url)
+            for mode, origin, url, mode_dir, extra_opts in tasks
+        }
+
+        for future in as_completed(future_to_item):
+            mode, origin, url = future_to_item[future]
+            success, lines = future.result()
+            group_key = (mode, origin)
+            if not success:
+                failures.append((url, mode))
+            else:
                 if mode == "paths":
                     lines = filter_lines_to_origin(lines, origin)
-                seed_results.append(lines)
+                group_results[group_key].append(lines)
 
-            if seed_results:
-                merged_lines = merge_origin_results(mode, seed_urls, seed_results)
-                write_origin_results(origin, mode_dir, merged_lines)
+            group_remaining[group_key] -= 1
+            if group_remaining[group_key] == 0:
+                seed_results = group_results[group_key]
+                if seed_results:
+                    merged_lines = merge_origin_results(
+                        mode,
+                        group_seed_urls[group_key],
+                        seed_results,
+                    )
+                    write_origin_results(origin, group_mode_dirs[group_key], merged_lines)
 
     if failures:
         print(f"[!] Katana failed for {len(failures)} target/mode combinations.", file=sys.stderr)
