@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 PROJECT_NAME = "simplescripts"
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 SUMMARY = "Collection of offensive-security and utility scripts from the SimpleScripts repository."
 REQUIRES_PYTHON = ">=3.10"
 LICENSE = "MIT"
@@ -60,7 +60,10 @@ SCRIPT_SPECS = [
     ("Scanners/masscan_to_nmap.py", "masscan_to_nmap.py"),
     ("Scanners/masscan_to_httpx.py", "masscan_to_httpx.py"),
     ("Scanners/masscan_to_url.py", "masscan_to_url.py"),
+    ("Scanners/nmap_to_analyze.py", "nmap_to_analyze.py"),
+    ("Scanners/nmap_to_httpx.py", "nmap_to_httpx.py"),
     ("Scanners/nmap_to_ip-port.py", "nmap_to_ip-port.py"),
+    ("Scanners/nmap_to_ip.py", "nmap_to_ip.py"),
     ("Scanners/nmap_to_url.py", "nmap_to_url.py"),
     ("Assistants/maketask.py", "maketask"),
     ("Linux/ssh_persist.py", "ssh_persist.py"),

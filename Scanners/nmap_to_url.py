@@ -240,6 +240,42 @@ def build_url(target: str, port_element: ET.Element) -> str | None:
     return _format_url_host_port(host, portid, protocol)
 
 
+def build_all_port_urls(target: str, port_element: ET.Element) -> list[str]:
+    """
+    Build HTTP and HTTPS URLs for any open TCP <port> element.
+    """
+    portid = port_element.get('portid')
+    protocol_attr = (port_element.get('protocol') or '').lower()
+    state_element = port_element.find('state')
+
+    if protocol_attr != 'tcp':
+        return []
+
+    if state_element is None or state_element.get('state') != 'open':
+        return []
+
+    if not portid:
+        return []
+
+    host = _normalize_host(target)
+    return [
+        f"http://{host}:{portid}/",
+        f"https://{host}:{portid}/",
+    ]
+
+
+def _all_port_url_sort_key(url: str) -> tuple[str, int, int, str]:
+    """Sort all-ports URLs by host, numeric port, then scheme."""
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+
+    scheme_order = {"http": 0, "https": 1}.get(parsed.scheme, 2)
+    return (parsed.hostname or "", port or 0, scheme_order, url)
+
+
 def _write_urls(extracted_urls: list[str], output_path: Path | None) -> None:
     output_text = "".join(f"{url}\n" for url in extracted_urls)
     if output_path is None:
@@ -255,6 +291,7 @@ def parse_nmap_xml(
     input_file: str | Path,
     output_file: str | Path | None,
     all_hostnames: bool = False,
+    all_ports: bool = False,
 ) -> bool:
     """
     Parse nmap XML and extract URLs for HTTP/HTTPS services.
@@ -285,16 +322,24 @@ def parse_nmap_xml(
 
         for port in host.findall('./ports/port'):
             for target in targets:
-                url = build_url(target, port)
-                if url and url not in seen:
-                    seen.add(url)
-                    extracted_urls.append(url)
+                urls = (
+                    build_all_port_urls(target, port)
+                    if all_ports
+                    else [build_url(target, port)]
+                )
+                for url in urls:
+                    if url and url not in seen:
+                        seen.add(url)
+                        extracted_urls.append(url)
 
     if not extracted_urls:
         logging.warning("No matching URLs were found.")
         return False
 
-    extracted_urls.sort()
+    if all_ports:
+        extracted_urls.sort(key=_all_port_url_sort_key)
+    else:
+        extracted_urls.sort()
     _write_urls(extracted_urls, output_path)
     return True
 
@@ -309,9 +354,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help='Output file to write URLs (default: stdout)',
     )
     parser.add_argument(
+        '-ah',
         '--all-hostnames',
         action='store_true',
         help='Generate URLs for every hostname in a host entry instead of only the first one.',
+    )
+    parser.add_argument(
+        '-ap',
+        '--all-ports',
+        action='store_true',
+        dest='all_ports',
+        help='Generate HTTP and HTTPS URLs for every open TCP port.',
     )
     return parser.parse_args(argv)
 
@@ -320,7 +373,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
 
     try:
-        wrote_output = parse_nmap_xml(args.input, args.output, all_hostnames=args.all_hostnames)
+        wrote_output = parse_nmap_xml(
+            args.input,
+            args.output,
+            all_hostnames=args.all_hostnames,
+            all_ports=args.all_ports,
+        )
     except FileNotFoundError as exc:
         logging.error("%s", exc)
         return 1

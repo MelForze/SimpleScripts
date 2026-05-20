@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Extract unique open TCP ports and generate an httpx command."""
+"""Extract unique open TCP ports from nmap XML and generate an httpx command."""
 
 import argparse
 import logging
-import re
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 
 def create_argument_parser(*args, **kwargs):
@@ -19,8 +19,6 @@ def create_argument_parser(*args, **kwargs):
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
-RE_DISCOVERED = re.compile(r"Discovered open port (\d+)/(\w+) on ", re.IGNORECASE)
-RE_LIST = re.compile(r"^open\s+(\w+)\s+(\d+)\s+", re.IGNORECASE)
 HTTPX_COMMAND_TEMPLATE = (
     "httpx -l scope.txt -sc -cl -ct -location -hash md5 -rt -lc -wc -title -server -td "
     "-method -ws -ip -cname -cdn -ss -system-chrome -sid 10 -p PORTS -pipeline -http2 "
@@ -48,18 +46,18 @@ def setup_logging(verbose: bool) -> None:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = create_argument_parser(
-        description="Extract unique open TCP ports and generate an httpx command."
+        description="Extract unique open TCP ports from nmap XML and generate an httpx command."
     )
     parser.add_argument(
         'file',
         nargs='?',
         metavar='FILE',
-        help="Path to the input scan file (legacy positional argument)"
+        help="Path to the input nmap XML file (legacy positional argument)"
     )
     parser.add_argument(
         '-i', '--input',
         dest='input_file',
-        help="Path to the input scan file"
+        help="Path to the input nmap XML file"
     )
     parser.add_argument(
         '-v', '--verbose',
@@ -76,53 +74,59 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _iter_lines(file_path: Path) -> Iterable[str]:
-    with file_path.open('r', encoding='utf-8', errors='ignore') as handle:
-        for line in handle:
-            yield line.rstrip('\n')
+def host_is_up(host: ET.Element) -> bool:
+    """Return True when the host is up or when status is absent."""
+    status = host.find("status")
+    if status is None:
+        return True
+    return (status.get("state") or "").lower() == "up"
 
 
-def _extract_tcp_port_from_line(line: str) -> int | None:
-    discovered_match = RE_DISCOVERED.search(line)
-    if discovered_match:
-        protocol = discovered_match.group(2).lower()
-        if protocol != "tcp":
-            return None
-        return int(discovered_match.group(1))
+def _extract_tcp_port(port: ET.Element) -> int | None:
+    """Return an open TCP port number from an nmap <port> element."""
+    protocol = (port.get("protocol") or "").lower()
+    if protocol != "tcp":
+        return None
 
-    list_match = RE_LIST.search(line)
-    if list_match:
-        protocol = list_match.group(1).lower()
-        if protocol != "tcp":
-            return None
-        return int(list_match.group(2))
+    state_element = port.find("state")
+    if state_element is None or state_element.get("state") != "open":
+        return None
 
-    return None
+    portid = port.get("portid")
+    if not portid:
+        return None
+
+    try:
+        port_num = int(portid)
+    except ValueError:
+        logging.warning("Skipping non-numeric port identifier: %r", portid)
+        return None
+
+    if not (1 <= port_num <= 65535):
+        logging.warning("Skipping out-of-range port: %s", port_num)
+        return None
+
+    return port_num
 
 
 def extract_tcp_ports(file_path: str | Path) -> set[int]:
-    """Read file and collect unique TCP ports from known masscan formats."""
+    """Read nmap XML and collect unique open TCP ports."""
     path = Path(file_path)
+    tree = ET.parse(path)
+    root = tree.getroot()
     tcp_ports: set[int] = set()
 
-    for line in _iter_lines(path):
-        if not line or line.startswith("#"):
+    for host in root.findall('host'):
+        if not host_is_up(host):
+            logging.debug("Skipping host because its state is not up.")
             continue
 
-        try:
-            port = _extract_tcp_port_from_line(line)
-        except ValueError:
-            logging.warning("Skipping invalid line: %r", line)
-            continue
-
-        if port is None:
-            continue
-        if not (1 <= port <= 65535):
-            logging.warning("Skipping out-of-range port: %s", port)
-            continue
-
-        tcp_ports.add(port)
-        logging.debug("Found open tcp port: %s", port)
+        for port in host.findall('./ports/port'):
+            port_num = _extract_tcp_port(port)
+            if port_num is None:
+                continue
+            tcp_ports.add(port_num)
+            logging.debug("Found open tcp port: %s", port_num)
 
     return tcp_ports
 
@@ -178,6 +182,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         tcp_ports = extract_tcp_ports(file_path)
+    except ET.ParseError as exc:
+        logging.error("Failed to parse XML: %s", exc)
+        return 1
     except OSError as exc:
         logging.error("I/O error while reading %s: %s", file_path, exc)
         return 1

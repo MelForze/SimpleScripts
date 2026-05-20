@@ -76,6 +76,12 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Output file for URLs (default: stdout).",
     )
+    parser.add_argument(
+        "-ap",
+        "--all-ports",
+        action="store_true",
+        help="Generate HTTP and HTTPS URLs for every open TCP port.",
+    )
     return parser.parse_args(argv)
 
 
@@ -170,13 +176,23 @@ def make_url(
     return f"{scheme}://{normalized_host}:{port}"
 
 
+def make_all_port_urls(host: str, port: int) -> List[str]:
+    """Build HTTP and HTTPS URLs for any open TCP port."""
+    normalized_host = normalize_host_for_url(host)
+    return [
+        f"http://{normalized_host}:{port}",
+        f"https://{normalized_host}:{port}",
+    ]
+
+
 def masscan_to_urls(
     lines: Iterable[str],
+    all_ports: bool = False,
 ) -> List[str]:
     """
     Convert an iterable of masscan output lines to a list of unique HTTP/HTTPS URLs.
 
-    Only ports recognized as HTTP/HTTPS are converted.
+    By default only ports recognized as HTTP/HTTPS are converted.
     URLs are deduplicated while preserving the first-seen order.
     """
     seen: Set[str] = set()
@@ -188,16 +204,18 @@ def masscan_to_urls(
             continue
 
         for host, port in extract_hosts_ports(line):
-            url = make_url(
-                host=host,
-                port=port,
+            generated_urls = (
+                make_all_port_urls(host, port)
+                if all_ports
+                else [make_url(host=host, port=port)]
             )
-            if url is None:
-                # Non-web port, skip it
-                continue
-            if url not in seen:
-                seen.add(url)
-                urls.append(url)
+            for generated_url in generated_urls:
+                if generated_url is None:
+                    # Non-web port, skip it
+                    continue
+                if generated_url not in seen:
+                    seen.add(generated_url)
+                    urls.append(generated_url)
 
     return urls
 
@@ -226,7 +244,7 @@ def main(argv: List[str] | None = None) -> int:
 
     try:
         lines = read_lines(args.input)
-        urls = masscan_to_urls(lines=lines)
+        urls = masscan_to_urls(lines=lines, all_ports=args.all_ports)
         if not urls:
             logging.warning("No matching HTTP/HTTPS URLs were found.")
             return 2

@@ -60,6 +60,18 @@ class PackagingContractsTests(unittest.TestCase):
                 "simplescripts_scripts/Scanners/masscan_to_httpx.py",
                 names,
             )
+            self.assertIn(
+                "simplescripts_scripts/Scanners/nmap_to_httpx.py",
+                names,
+            )
+            self.assertIn(
+                "simplescripts_scripts/Scanners/nmap_to_analyze.py",
+                names,
+            )
+            self.assertIn(
+                "simplescripts_scripts/Scanners/nmap_to_ip.py",
+                names,
+            )
 
 
 if __name__ == "__main__":

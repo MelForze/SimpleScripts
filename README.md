@@ -14,6 +14,7 @@ This repository consists of scripts that can make life easier for both me and yo
 You can install the repository directly with `pipx`:
 
 ```bash
+pipx ensurepath
 pipx install git+https://github.com/MelForze/SimpleScripts.git
 ```
 
@@ -21,6 +22,25 @@ For local development / local checkout:
 
 ```bash
 pipx install .
+```
+
+To refresh an existing installation from the repository:
+
+```bash
+pipx upgrade simplescripts
+```
+
+Installed scanner commands include:
+
+```bash
+masscan_to_httpx.py
+masscan_to_nmap.py
+masscan_to_url.py
+nmap_to_analyze.py
+nmap_to_httpx.py
+nmap_to_ip.py
+nmap_to_ip-port.py
+nmap_to_url.py
 ```
 
 ## To Do
