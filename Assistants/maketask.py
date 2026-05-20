@@ -47,6 +47,7 @@ EXTERNAL_DIRS = [
 ]
 
 INTERNAL_DIRS = [
+    "bloodhound",
     "ffuf",
     "httpx",
     "katana",
@@ -54,9 +55,6 @@ INTERNAL_DIRS = [
     "nessus",
     "nmap",
     "nuclei",
-]
-
-AD_DIRS = [
     "ad_office",
     "ad_pci",
 ]
@@ -160,22 +158,23 @@ def create_project_structure(
     project_path: Path,
     has_external: bool,
     has_internal: bool,
-    has_ad: bool,
+    has_wifi: bool,
     has_mobile: bool,
 ) -> None:
     (project_path / "Report").mkdir(parents=True, exist_ok=True)
     (project_path / "Screenshots").mkdir(parents=True, exist_ok=True)
 
-    external_prefix = "External" if has_external and has_internal else ""
-    internal_prefix = "Internal" if has_external and has_internal else ""
+    external_prefix = "external" if has_external and has_internal else ""
+    internal_prefix = "internal" if has_external and has_internal else ""
 
     if has_external:
         ensure_scoped_dirs(project_path, external_prefix, EXTERNAL_DIRS)
 
     if has_internal:
         ensure_scoped_dirs(project_path, internal_prefix, INTERNAL_DIRS)
-        if has_ad:
-            ensure_scoped_dirs(project_path, internal_prefix, AD_DIRS)
+
+    if has_wifi:
+        (project_path / "wifi").mkdir(parents=True, exist_ok=True)
 
     if has_mobile:
         ensure_scoped_dirs(project_path, "Mobile", MOBILE_DIRS)
@@ -218,14 +217,14 @@ def main(argv: list[str] | None = None) -> int:
 
         has_external = ask_yn("Is there External pentesting scope?")
         has_internal = ask_yn("Is there Internal pentesting scope?")
-        has_ad = has_internal and ask_yn("Is this a Windows environment with Active Directory?")
+        has_wifi = ask_yn("Is there WiFi pentesting scope?")
         has_mobile = ask_yn("Is there Mobile pentesting scope?")
 
         create_project_structure(
             project_path=project_path,
             has_external=has_external,
             has_internal=has_internal,
-            has_ad=has_ad,
+            has_wifi=has_wifi,
             has_mobile=has_mobile,
         )
     except (OSError, ProjectCreationError) as exc:
