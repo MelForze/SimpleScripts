@@ -30,19 +30,6 @@ To refresh an existing installation from the repository:
 pipx upgrade simplescripts
 ```
 
-Installed scanner commands include:
-
-```bash
-masscan_to_httpx.py
-masscan_to_nmap.py
-masscan_to_url.py
-nmap_to_analyze.py
-nmap_to_httpx.py
-nmap_to_ip.py
-nmap_to_ip-port.py
-nmap_to_url.py
-```
-
 ## To Do
 
 - [x] **Create Wildcard Hunter Script**  
