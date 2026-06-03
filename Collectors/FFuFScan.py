@@ -1074,9 +1074,9 @@ def collect_unique_result_rows(
     output_root: Path,
     summaries: list[dict[str, object]],
 ) -> dict[str, list[dict[str, str]]]:
-    """Collect first ffuf result per host/path/status/size for manual review."""
+    """Collect first ffuf result per host/status/size for manual review."""
     grouped: dict[str, list[dict[str, str]]] = {}
-    seen_by_host: dict[str, set[tuple[str, str, str]]] = {}
+    seen_by_host: dict[str, set[tuple[str, str]]] = {}
 
     for summary in sorted(summaries, key=lambda item: str(item.get("name", ""))):
         result_json = summary_result_json_path(output_root, summary)
@@ -1090,7 +1090,7 @@ def collect_unique_result_rows(
             path = path_from_result_url(url)
             status = scalar_text(result_value(item, "status", "status_code", "StatusCode"))
             size = scalar_text(result_value(item, "length", "size", "content_length", "ContentLength"))
-            key = (path, status, size)
+            key = (status, size)
             seen = seen_by_host.setdefault(host, set())
             if key in seen:
                 continue
@@ -1158,7 +1158,7 @@ def write_unique_paths_html(output_root: Path, summaries: list[dict[str, object]
             f"<span>Generated: {html_escape(generated_at)}</span>"
             f"<span>Hosts: {len(grouped)}</span>"
             f"<span>Unique rows: {total_rows}</span>"
-            "<span>Uniqueness: host + path + status + size</span>"
+            "<span>Uniqueness: host + status + size</span>"
             "</div>"
         ),
         "</header>",
