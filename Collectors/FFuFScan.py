@@ -1303,22 +1303,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Maximum number of concurrent ffuf jobs. Default: 2",
     )
     parser.add_argument(
+        "-r",
         "--rate",
         type=int,
         default=300,
         help="ffuf -rate value for each job. Default: 300",
     )
     parser.add_argument(
+        "-e",
         "--extensions",
         type=str,
         default=None,
         help="Comma-separated extension list for ffuf -e, for example: php,asp,aspx",
     )
     parser.add_argument(
+        "-H",
         "--header",
+        "--headers",
         dest="headers",
         action="append",
-        help='Additional ffuf header, repeat as needed. Example: --header "Cookie: name=value"',
+        help='Additional ffuf header, repeat as needed. Example: -H "Cookie: name=value"',
     )
     parser.add_argument(
         "--proxy",
@@ -1327,12 +1331,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Proxy to pass to ffuf -x, for example: http://127.0.0.1:8080",
     )
     parser.add_argument(
-        "-r",
+        "-fr",
         "--follow-redirects",
         action="store_true",
         help="Pass -r to ffuf to follow redirects.",
     )
     parser.add_argument(
+        "-rd",
         "--recursion-depth",
         type=int,
         default=0,
