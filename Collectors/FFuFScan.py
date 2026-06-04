@@ -26,6 +26,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 KATANA_SUFFIX = "_Katana.txt"
 PROGRESS_RE = re.compile(r"Progress:\s*\[(\d+)/(\d+)\]")
+FFUF_JOB_RE = re.compile(r"Job\s*\[(\d+)/(\d+)\]")
 ERRORS_RE = re.compile(r"Errors:\s*(\d+)")
 PRIMARY_RESULT_EXTENSIONS = (".json", ".html", ".md", ".csv")
 EXTRA_RESULT_EXTENSIONS = (".ejson", ".ecsv")
@@ -240,6 +241,7 @@ def format_job_line(
     rate: float,
     state: str,
     elapsed_seconds: int,
+    extra: str | None = None,
 ) -> str:
     """Return one compact status line for a running job."""
     total = max(total, 1)
@@ -253,10 +255,13 @@ def format_job_line(
     filled = int(bar_width * done / total)
     bar = "#" * filled + "-" * (bar_width - filled)
     rate_text = "--/s" if rate <= 0 else f"{rate:.1f}/s"
-    return (
+    line = (
         f"  [{idx}] {name:<30} {state:<8} [{bar}] {percent:3d}%  "
         f"({done}/{total}) ETA {eta_text} Elapsed {elapsed_text} Rate {rate_text}"
     )
+    if extra:
+        line += f"  {extra}"
+    return line
 
 
 def print_job_line(
@@ -269,6 +274,29 @@ def print_job_line(
     elapsed_seconds: int,
 ) -> None:
     print(format_job_line(idx, name, done, total, rate, state, elapsed_seconds))
+
+
+def running_job_display_state(job: FfufJob, now: float) -> tuple[str, str]:
+    """Return a clearer state/heartbeat for a still-running ffuf process."""
+    state = "running"
+    parts: list[str] = []
+    spinner = "|/-\\"[int(now * 4) % 4]
+
+    if job.ffuf_job_current is not None and job.ffuf_job_total is not None:
+        parts.append(f"ffuf job {job.ffuf_job_current}/{job.ffuf_job_total}")
+
+    last_activity = job.last_stderr_activity or job.started or now
+    idle_seconds = int(max(0.0, now - last_activity))
+    progress_complete = job.saw_progress and job.done_est >= max(job.total, 1)
+    if progress_complete:
+        state = "recursing" if "-recursion" in job.cmd else "active"
+        parts.append(f"alive {spinner}")
+        parts.append(f"idle {idle_seconds}s")
+    elif idle_seconds >= 5:
+        parts.append(f"alive {spinner}")
+        parts.append(f"idle {idle_seconds}s")
+
+    return state, " ".join(parts)
 
 
 def clear_lines(count: int) -> None:
@@ -362,6 +390,42 @@ def build_specs_from_paths_dir(directory: Path) -> list[JobSpec]:
     return specs
 
 
+def seed_slug(seed_url: str) -> str:
+    """Return a compact filesystem-safe slug for a seed URL path."""
+    try:
+        parsed = urlsplit(seed_url)
+    except ValueError:
+        return sha256_text(seed_url)[:8]
+    path = (parsed.path or "/").strip("/") or "root"
+    if parsed.query:
+        path += "_" + parsed.query
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", path).strip("_")
+    return (slug or "root")[:60]
+
+
+def split_specs_for_native_recursion(specs: list[JobSpec]) -> list[JobSpec]:
+    """Split multi-seed jobs because ffuf native recursion supports only FUZZ in -u."""
+    expanded: list[JobSpec] = []
+    used_names: set[str] = set()
+    for spec in specs:
+        if len(spec.seed_urls) <= 1:
+            name = spec.name
+            if name in used_names:
+                name = f"{name}_{sha256_text('|'.join(spec.seed_urls))[:8]}"
+            used_names.add(name)
+            expanded.append(JobSpec(name=name, seed_urls=spec.seed_urls))
+            continue
+
+        for seed_url in spec.seed_urls:
+            base_name = f"{spec.name}_{seed_slug(seed_url)}"
+            name = base_name
+            if name in used_names:
+                name = f"{base_name}_{sha256_text(seed_url)[:8]}"
+            used_names.add(name)
+            expanded.append(JobSpec(name=name, seed_urls=[seed_url]))
+    return expanded
+
+
 def build_ffuf_cmd(
     seeds_file: Path,
     wordlist: Path,
@@ -372,18 +436,32 @@ def build_ffuf_cmd(
     extensions: list[str] | None,
     follow_redirects: bool,
     recursion_depth: int = 0,
+    recursion_strategy: str = "default",
+    base_url: str | None = None,
 ) -> list[str]:
     """Build an ffuf command for one job."""
     cmd = [
         "ffuf",
         "-c",
         "-noninteractive",
-        "-w",
-        f"{seeds_file}:URL",
-        "-w",
-        f"{wordlist}:FUZZ",
-        "-u",
-        "URLFUZZ",
+    ]
+    if base_url:
+        cmd += [
+            "-w",
+            f"{wordlist}:FUZZ",
+            "-u",
+            f"{base_url}FUZZ",
+        ]
+    else:
+        cmd += [
+            "-w",
+            f"{seeds_file}:URL",
+            "-w",
+            f"{wordlist}:FUZZ",
+            "-u",
+            "URLFUZZ",
+        ]
+    cmd += [
         "-of",
         "all",
         "-o",
@@ -400,7 +478,13 @@ def build_ffuf_cmd(
     if follow_redirects:
         cmd.append("-r")
     if recursion_depth > 0:
-        cmd += ["-recursion", "-recursion-depth", str(recursion_depth)]
+        cmd += [
+            "-recursion",
+            "-recursion-depth",
+            str(recursion_depth),
+            "-recursion-strategy",
+            recursion_strategy,
+        ]
     return cmd
 
 
@@ -430,9 +514,13 @@ class FfufJob:
     progress_rate: float = 0.0
     last_progress_value: int = 0
     last_progress_time: float = 0.0
+    last_display_progress_value: int = 0
+    last_stderr_activity: float = 0.0
     ffuf_errors: int | None = None
     ffuf_progress_done: int | None = None
     ffuf_progress_total: int | None = None
+    ffuf_job_current: int | None = None
+    ffuf_job_total: int | None = None
     stopped: bool = False
     stop_reason: str | None = None
     stop_requested_at: float = 0.0
@@ -723,6 +811,7 @@ def apply_stop_requests(
 def run_ffuf_background(job: FfufJob) -> None:
     """Start ffuf for one job in the background."""
     job.started = time.time()
+    job.last_stderr_activity = job.started
     stderr_handle = job.stderr_log.open("w", encoding="utf-8")
     job.proc = subprocess.Popen(
         job.cmd,
@@ -749,6 +838,7 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
     if not chunk:
         return True
 
+    job.last_stderr_activity = time.time()
     job.progress_offset += len(chunk)
     text = chunk.decode("utf-8", errors="ignore").replace("\r", "\n")
     combined = job.progress_remainder + text
@@ -760,6 +850,11 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
         job.progress_remainder = ""
 
     for line in lines:
+        job_match = FFUF_JOB_RE.search(line)
+        if job_match:
+            job.ffuf_job_current = int(job_match.group(1))
+            job.ffuf_job_total = int(job_match.group(2))
+
         match = PROGRESS_RE.search(line)
         if match:
             now = time.time()
@@ -768,14 +863,26 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
             job.ffuf_progress_done = current
             job.ffuf_progress_total = total
             if total > 0:
-                job.total = total
-                job.done_est = max(job.done_est, current)
+                display_current = current
+                display_total = total
+                if (
+                    job.ffuf_job_current is not None
+                    and job.ffuf_job_total is not None
+                    and job.ffuf_job_current > 0
+                    and job.ffuf_job_total > 0
+                ):
+                    display_total = total * job.ffuf_job_total
+                    display_current = ((job.ffuf_job_current - 1) * total) + current
+                job.total = display_total
+                job.done_est = max(0, min(display_current, display_total))
                 job.saw_progress = True
-            if current > job.last_progress_value:
+            progress_value = job.done_est
+            if progress_value > job.last_display_progress_value:
                 if job.last_progress_time > 0:
                     delta_time = now - job.last_progress_time
                     if delta_time > 0:
-                        job.progress_rate = (current - job.last_progress_value) / delta_time
+                        job.progress_rate = (progress_value - job.last_display_progress_value) / delta_time
+                job.last_display_progress_value = progress_value
                 job.last_progress_value = current
                 job.last_progress_time = now
 
@@ -1223,6 +1330,8 @@ def prepare_job(job_spec: JobSpec, args: argparse.Namespace, extensions: list[st
 
     seeds_file = out_dir / "paths.txt"
     seeds_file.write_text("\n".join(job_spec.seed_urls) + "\n", encoding="utf-8")
+    recursion_depth = getattr(args, "recursion_depth", 0)
+    base_url = job_spec.seed_urls[0] if recursion_depth > 0 and len(job_spec.seed_urls) == 1 else None
 
     cmd = build_ffuf_cmd(
         seeds_file=seeds_file,
@@ -1233,7 +1342,9 @@ def prepare_job(job_spec: JobSpec, args: argparse.Namespace, extensions: list[st
         proxy=args.proxy,
         extensions=extensions,
         follow_redirects=args.follow_redirects,
-        recursion_depth=getattr(args, "recursion_depth", 0),
+        recursion_depth=recursion_depth,
+        recursion_strategy=getattr(args, "recursion_strategy", "default"),
+        base_url=base_url,
     )
     command_text = shlex.join(cmd)
     (out_dir / "command.txt").write_text(command_text + "\n", encoding="utf-8")
@@ -1344,6 +1455,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Enable ffuf recursion with the provided maximum depth. Default: 0 (disabled).",
     )
     parser.add_argument(
+        "-rs",
+        "--recursion-strategy",
+        choices=("default", "greedy"),
+        default="default",
+        help="ffuf recursion strategy when recursion is enabled. Default: default.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Skip jobs whose result.json already exists and is non-empty.",
@@ -1391,6 +1509,8 @@ def render_status(
         lines.append("  waiting to start")
     else:
         for job in running:
+            now = time.time()
+            state, extra = running_job_display_state(job, now)
             lines.append(
                 format_job_line(
                     job.job_id,
@@ -1398,8 +1518,9 @@ def render_status(
                     job.done_est,
                     job.total,
                     job.progress_rate,
-                    "running",
-                    int(max(0.0, time.time() - job.started)),
+                    state,
+                    int(max(0.0, now - job.started)),
+                    extra=extra,
                 )
             )
 
@@ -1458,6 +1579,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: Paths directory '{args.paths_dir}' not found.", file=sys.stderr)
             return 1
         specs = build_specs_from_paths_dir(args.paths_dir)
+
+    if args.recursion_depth > 0:
+        specs = split_specs_for_native_recursion(specs)
 
     if not specs:
         print("Error: No usable ffuf jobs were built from the provided input.", file=sys.stderr)
