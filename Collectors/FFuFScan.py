@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 from html import escape as html_escape
+import io
 import json
 import os
 import re
@@ -27,6 +29,7 @@ from urllib.parse import urlsplit, urlunsplit
 KATANA_SUFFIX = "_Katana.txt"
 PROGRESS_RE = re.compile(r"Progress:\s*\[(\d+)/(\d+)\]")
 FFUF_JOB_RE = re.compile(r"Job\s*\[(\d+)/(\d+)\]")
+SUBSCAN_RE = re.compile(r"FFUFScan subscan:\s*\[(\d+)/(\d+)\]\s+total=(\d+)")
 ERRORS_RE = re.compile(r"Errors:\s*(\d+)")
 PRIMARY_RESULT_EXTENSIONS = (".json", ".html", ".md", ".csv")
 EXTRA_RESULT_EXTENSIONS = (".ejson", ".ecsv")
@@ -68,9 +71,6 @@ def normalize_url(raw: str) -> str:
     path = parsed.path or "/"
     while "//" in path[1:]:
         path = path.replace("//", "/")
-    if path != "/":
-        path = path.rstrip("/") or "/"
-
     return urlunsplit((scheme, netloc, path, "", ""))
 
 
@@ -149,19 +149,104 @@ def tail_lines(path: Path, limit: int = 10) -> list[str]:
     return nonempty[-limit:]
 
 
+def ffuf_display_progress(
+    current: int,
+    total: int,
+    ffuf_job_current: int | None,
+    ffuf_job_total: int | None,
+) -> tuple[int, int]:
+    """Return progress adjusted for ffuf recursive internal Job [x/y] counters."""
+    display_current = current
+    display_total = total
+    if (
+        ffuf_job_current is not None
+        and ffuf_job_total is not None
+        and ffuf_job_current > 0
+        and ffuf_job_total > 0
+        and total > 0
+    ):
+        display_total = total * ffuf_job_total
+        display_current = ((ffuf_job_current - 1) * total) + current
+    return max(0, display_current), max(0, display_total)
+
+
+def ensure_int_list_size(values: list[int], size: int, default: int) -> None:
+    """Extend an int list to the requested size."""
+    while len(values) < size:
+        values.append(default)
+
+
+def subscan_aggregate_progress(
+    subscan_totals: list[int],
+    subscan_index: int,
+    current: int,
+    total: int,
+) -> tuple[int, int]:
+    """Return progress adjusted for sequential FFuFScan subscans."""
+    if not subscan_totals:
+        return current, total
+    subscan_index = max(0, min(subscan_index, len(subscan_totals) - 1))
+    subscan_totals[subscan_index] = max(subscan_totals[subscan_index], total)
+    done = sum(subscan_totals[:subscan_index]) + min(current, subscan_totals[subscan_index])
+    return done, sum(subscan_totals)
+
+
 def parse_ffuf_stderr_diagnostics(text: str) -> dict[str, int | None]:
     """Return the last ffuf progress and error counters from stderr text."""
     diagnostics: dict[str, int | None] = {
         "progress_done": None,
         "progress_total": None,
         "errors": None,
+        "ffuf_job_current": None,
+        "ffuf_job_total": None,
+        "subscan_current": None,
+        "subscan_total": None,
     }
+    ffuf_job_current: int | None = None
+    ffuf_job_total: int | None = None
+    subscan_index = 0
+    subscan_totals: list[int] = []
     normalized = text.replace("\r", "\n")
     for line in normalized.splitlines():
+        subscan_match = SUBSCAN_RE.search(line)
+        if subscan_match:
+            subscan_current = int(subscan_match.group(1))
+            subscan_total = int(subscan_match.group(2))
+            subscan_estimate = int(subscan_match.group(3))
+            ensure_int_list_size(subscan_totals, subscan_total, subscan_estimate)
+            subscan_index = max(0, min(subscan_current - 1, len(subscan_totals) - 1))
+            subscan_totals[subscan_index] = max(subscan_totals[subscan_index], subscan_estimate)
+            diagnostics["subscan_current"] = subscan_current
+            diagnostics["subscan_total"] = subscan_total
+            ffuf_job_current = None
+            ffuf_job_total = None
+
+        job_match = FFUF_JOB_RE.search(line)
+        if job_match:
+            ffuf_job_current = int(job_match.group(1))
+            ffuf_job_total = int(job_match.group(2))
+            diagnostics["ffuf_job_current"] = ffuf_job_current
+            diagnostics["ffuf_job_total"] = ffuf_job_total
+
         progress_match = PROGRESS_RE.search(line)
         if progress_match:
-            diagnostics["progress_done"] = int(progress_match.group(1))
-            diagnostics["progress_total"] = int(progress_match.group(2))
+            current = int(progress_match.group(1))
+            total = int(progress_match.group(2))
+            display_current, display_total = ffuf_display_progress(
+                current,
+                total,
+                ffuf_job_current,
+                ffuf_job_total,
+            )
+            if subscan_totals:
+                display_current, display_total = subscan_aggregate_progress(
+                    subscan_totals,
+                    subscan_index,
+                    display_current,
+                    display_total,
+                )
+            diagnostics["progress_done"] = display_current
+            diagnostics["progress_total"] = display_total
         errors_match = ERRORS_RE.search(line)
         if errors_match:
             diagnostics["errors"] = int(errors_match.group(1))
@@ -173,7 +258,15 @@ def read_ffuf_stderr_diagnostics(path: Path) -> dict[str, int | None]:
     try:
         return parse_ffuf_stderr_diagnostics(path.read_text(encoding="utf-8", errors="ignore"))
     except OSError:
-        return {"progress_done": None, "progress_total": None, "errors": None}
+        return {
+            "progress_done": None,
+            "progress_total": None,
+            "errors": None,
+            "ffuf_job_current": None,
+            "ffuf_job_total": None,
+            "subscan_current": None,
+            "subscan_total": None,
+        }
 
 
 def build_job_hashes(seeds_file: Path, wordlist: Path, command_text: str) -> dict[str, str]:
@@ -233,6 +326,13 @@ def estimate_total_requests(paths_file: Path, wordlist: Path, extensions: list[s
     return paths_count * words_count * multiplier
 
 
+def estimate_single_seed_requests(wordlist: Path, extensions: list[str] | None) -> int:
+    """Estimate ffuf request count for one direct -u <seed>FUZZ command."""
+    words_count = count_nonempty_lines(wordlist)
+    multiplier = 1 + (len(extensions) if extensions else 0)
+    return words_count * multiplier
+
+
 def format_job_line(
     idx: int,
     name: str,
@@ -282,6 +382,8 @@ def running_job_display_state(job: FfufJob, now: float) -> tuple[str, str]:
     parts: list[str] = []
     spinner = "|/-\\"[int(now * 4) % 4]
 
+    if job.subscan_total_count > 1:
+        parts.append(f"seed {job.active_subscan_index + 1}/{job.subscan_total_count}")
     if job.ffuf_job_current is not None and job.ffuf_job_total is not None:
         parts.append(f"ffuf job {job.ffuf_job_current}/{job.ffuf_job_total}")
 
@@ -289,7 +391,7 @@ def running_job_display_state(job: FfufJob, now: float) -> tuple[str, str]:
     idle_seconds = int(max(0.0, now - last_activity))
     progress_complete = job.saw_progress and job.done_est >= max(job.total, 1)
     if progress_complete:
-        state = "recursing" if "-recursion" in job.cmd else "active"
+        state = "recursing" if job_has_recursion(job) else "active"
         parts.append(f"alive {spinner}")
         parts.append(f"idle {idle_seconds}s")
     elif idle_seconds >= 5:
@@ -403,29 +505,6 @@ def seed_slug(seed_url: str) -> str:
     return (slug or "root")[:60]
 
 
-def split_specs_for_native_recursion(specs: list[JobSpec]) -> list[JobSpec]:
-    """Split multi-seed jobs because ffuf native recursion supports only FUZZ in -u."""
-    expanded: list[JobSpec] = []
-    used_names: set[str] = set()
-    for spec in specs:
-        if len(spec.seed_urls) <= 1:
-            name = spec.name
-            if name in used_names:
-                name = f"{name}_{sha256_text('|'.join(spec.seed_urls))[:8]}"
-            used_names.add(name)
-            expanded.append(JobSpec(name=name, seed_urls=spec.seed_urls))
-            continue
-
-        for seed_url in spec.seed_urls:
-            base_name = f"{spec.name}_{seed_slug(seed_url)}"
-            name = base_name
-            if name in used_names:
-                name = f"{base_name}_{sha256_text(seed_url)[:8]}"
-            used_names.add(name)
-            expanded.append(JobSpec(name=name, seed_urls=[seed_url]))
-    return expanded
-
-
 def build_ffuf_cmd(
     seeds_file: Path,
     wordlist: Path,
@@ -488,6 +567,34 @@ def build_ffuf_cmd(
     return cmd
 
 
+def shell_lines(commands: list[list[str]]) -> list[str]:
+    """Return shell-quoted command lines."""
+    return [shlex.join(command) for command in commands]
+
+
+def job_commands(job: "FfufJob") -> list[list[str]]:
+    """Return all ffuf commands represented by a job."""
+    if job.subscans:
+        return [subscan.cmd for subscan in job.subscans]
+    return [job.cmd]
+
+
+def job_has_recursion(job: "FfufJob") -> bool:
+    """Return whether a job command enables ffuf recursion."""
+    return any("-recursion" in command for command in job_commands(job))
+
+
+@dataclass
+class FfufSubscan:
+    index: int
+    total: int
+    seed_url: str
+    out_dir: Path
+    cmd: list[str]
+    command_text: str
+    estimated_total: int
+
+
 @dataclass
 class FfufJob:
     job_id: int
@@ -521,6 +628,10 @@ class FfufJob:
     ffuf_progress_total: int | None = None
     ffuf_job_current: int | None = None
     ffuf_job_total: int | None = None
+    subscans: list[FfufSubscan] = field(default_factory=list)
+    active_subscan_index: int = 0
+    subscan_total_count: int = 1
+    subscan_totals: list[int] = field(default_factory=list)
     stopped: bool = False
     stop_reason: str | None = None
     stop_requested_at: float = 0.0
@@ -768,6 +879,7 @@ def stop_job(job: FfufJob, reason: str, terminate_timeout: float = 2.0) -> None:
 
     if job.proc:
         job.retcode = job.proc.returncode
+    aggregate_recursive_subscan_outputs(job)
     job.result_count = read_result_count(job.out_dir / "result.json")
 
 
@@ -808,19 +920,53 @@ def apply_stop_requests(
     return messages
 
 
-def run_ffuf_background(job: FfufJob) -> None:
-    """Start ffuf for one job in the background."""
-    job.started = time.time()
-    job.last_stderr_activity = job.started
-    stderr_handle = job.stderr_log.open("w", encoding="utf-8")
+def active_subscan(job: FfufJob) -> FfufSubscan | None:
+    """Return the active sequential subscan for a job."""
+    if not job.subscans:
+        return None
+    if job.active_subscan_index < 0 or job.active_subscan_index >= len(job.subscans):
+        return None
+    return job.subscans[job.active_subscan_index]
+
+
+def write_subscan_marker(stderr_handle: io.TextIOBase, subscan: FfufSubscan) -> None:
+    """Write a parseable FFuFScan marker before a sequential subscan starts."""
+    stderr_handle.write(
+        f"FFUFScan subscan: [{subscan.index}/{subscan.total}] "
+        f"total={subscan.estimated_total} seed={subscan.seed_url}\n"
+    )
+    stderr_handle.flush()
+
+
+def start_active_ffuf_process(job: FfufJob, truncate_log: bool) -> None:
+    """Start the active ffuf process for a job or subscan."""
+    current_subscan = active_subscan(job)
+    cmd = current_subscan.cmd if current_subscan is not None else job.cmd
+    job.cmd = cmd
+    job.ffuf_job_current = None
+    job.ffuf_job_total = None
+    job.ffuf_progress_done = None
+    job.ffuf_progress_total = None
+    now = time.time()
+    job.last_stderr_activity = now
+    stderr_handle = job.stderr_log.open("w" if truncate_log else "a", encoding="utf-8")
+    if current_subscan is not None:
+        write_subscan_marker(stderr_handle, current_subscan)
     job.proc = subprocess.Popen(
-        job.cmd,
+        cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=stderr_handle,
         text=True,
     )
     stderr_handle.close()
+
+
+def run_ffuf_background(job: FfufJob) -> None:
+    """Start ffuf for one job in the background."""
+    job.started = time.time()
+    job.active_subscan_index = 0
+    start_active_ffuf_process(job, truncate_log=True)
 
 
 def update_job_progress_from_stderr(job: FfufJob) -> bool:
@@ -850,6 +996,22 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
         job.progress_remainder = ""
 
     for line in lines:
+        subscan_match = SUBSCAN_RE.search(line)
+        if subscan_match:
+            subscan_current = int(subscan_match.group(1))
+            subscan_total = int(subscan_match.group(2))
+            subscan_estimate = int(subscan_match.group(3))
+            job.subscan_total_count = max(1, subscan_total)
+            ensure_int_list_size(job.subscan_totals, subscan_total, subscan_estimate)
+            job.active_subscan_index = max(0, min(subscan_current - 1, len(job.subscan_totals) - 1))
+            job.subscan_totals[job.active_subscan_index] = max(
+                job.subscan_totals[job.active_subscan_index],
+                subscan_estimate,
+            )
+            job.total = max(job.total, sum(job.subscan_totals))
+            job.ffuf_job_current = None
+            job.ffuf_job_total = None
+
         job_match = FFUF_JOB_RE.search(line)
         if job_match:
             job.ffuf_job_current = int(job_match.group(1))
@@ -863,16 +1025,21 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
             job.ffuf_progress_done = current
             job.ffuf_progress_total = total
             if total > 0:
-                display_current = current
-                display_total = total
-                if (
-                    job.ffuf_job_current is not None
-                    and job.ffuf_job_total is not None
-                    and job.ffuf_job_current > 0
-                    and job.ffuf_job_total > 0
-                ):
-                    display_total = total * job.ffuf_job_total
-                    display_current = ((job.ffuf_job_current - 1) * total) + current
+                display_current, display_total = ffuf_display_progress(
+                    current,
+                    total,
+                    job.ffuf_job_current,
+                    job.ffuf_job_total,
+                )
+                if job.subscan_totals:
+                    display_current, display_total = subscan_aggregate_progress(
+                        job.subscan_totals,
+                        job.active_subscan_index,
+                        display_current,
+                        display_total,
+                    )
+                job.ffuf_progress_done = display_current
+                job.ffuf_progress_total = display_total
                 job.total = display_total
                 job.done_est = max(0, min(display_current, display_total))
                 job.saw_progress = True
@@ -900,12 +1067,24 @@ def reap_job(job: FfufJob) -> None:
     retcode = job.proc.poll()
     if retcode is None:
         return
+    if retcode == 0 and job.subscans and job.active_subscan_index + 1 < len(job.subscans):
+        if job.subscan_totals:
+            completed_index = max(0, min(job.active_subscan_index, len(job.subscan_totals) - 1))
+            job.done_est = min(sum(job.subscan_totals[: completed_index + 1]), max(job.total, 1))
+        job.active_subscan_index += 1
+        job.proc = None
+        start_active_ffuf_process(job, truncate_log=False)
+        return
+
     job.retcode = retcode
     job.finished = True
     job.failed = retcode != 0
     job.duration_seconds = max(0.0, time.time() - job.started)
-    job.done_est = job.total
+    if job.subscans:
+        aggregate_recursive_subscan_outputs(job)
     job.result_count = read_result_count(job.out_dir / "result.json")
+    if not job.failed:
+        job.done_est = job.total
 
 
 def cleanup_ffuf_outputs(out_dir: Path) -> None:
@@ -1177,6 +1356,140 @@ def read_ffuf_result_items(result_json: Path) -> list[dict[str, object]]:
     return read_ffuf_result_json(result_json).items
 
 
+def subscan_output_paths(job_root: Path, subscan: FfufSubscan) -> dict[str, str]:
+    """Return job-root-relative subscan output paths."""
+    return {
+        "json": relpath_or_absolute(job_root, subscan.out_dir / "result.json"),
+        "html": relpath_or_absolute(job_root, subscan.out_dir / "result.html"),
+        "md": relpath_or_absolute(job_root, subscan.out_dir / "result.md"),
+        "csv": relpath_or_absolute(job_root, subscan.out_dir / "result.csv"),
+    }
+
+
+def aggregate_recursive_subscan_outputs(job: FfufJob) -> None:
+    """Build top-level result files from sequential recursive subscan outputs."""
+    if not job.subscans:
+        return
+
+    aggregated_results: list[dict[str, object]] = []
+    subscan_summaries: list[dict[str, object]] = []
+    for subscan in job.subscans:
+        result_json = subscan.out_dir / "result.json"
+        read_result = read_ffuf_result_json(result_json)
+        items = read_result.items if read_result.state in {"readable", "empty"} else []
+        aggregated_results.extend(dict(item) for item in items)
+        subscan_summaries.append(
+            {
+                "index": subscan.index,
+                "total": subscan.total,
+                "seed_url": subscan.seed_url,
+                "state": read_result.state,
+                "result_count": len(items),
+                "outputs": subscan_output_paths(job.out_dir, subscan),
+            }
+        )
+
+    aggregate_json = {
+        "results": aggregated_results,
+        "ffufscan": {
+            "aggregated": True,
+            "subscan_count": len(job.subscans),
+            "subscans": subscan_summaries,
+        },
+    }
+    (job.out_dir / "result.json").write_text(
+        json.dumps(aggregate_json, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    html_lines = [
+        "<!doctype html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>FFUF Recursive Subscans - {html_escape(job.name)}</title>",
+        "<style>",
+        "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 24px; color: #18202a; }",
+        "table { border-collapse: collapse; width: 100%; }",
+        "th, td { border: 1px solid #d9dee7; padding: 8px 10px; text-align: left; vertical-align: top; }",
+        "th { background: #f3f5f8; }",
+        "a { color: #1f6feb; text-decoration: none; }",
+        "a:hover { text-decoration: underline; }",
+        "</style>",
+        "</head>",
+        "<body>",
+        f"<h1>FFUF Recursive Subscans - {html_escape(job.name)}</h1>",
+        f"<p>Total subscans: {len(job.subscans)}. Aggregated results: {len(aggregated_results)}.</p>",
+        "<table>",
+        "<thead><tr><th>#</th><th>Seed URL</th><th>State</th><th>Hits</th><th>JSON</th><th>HTML</th><th>MD</th><th>CSV</th></tr></thead>",
+        "<tbody>",
+    ]
+    for summary in subscan_summaries:
+        outputs = summary["outputs"]
+        outputs = outputs if isinstance(outputs, dict) else {}
+        html_lines.append(
+            "<tr>"
+            f"<td>{html_escape(str(summary['index']))}</td>"
+            f"<td>{html_escape(str(summary['seed_url']))}</td>"
+            f"<td>{html_escape(str(summary['state']))}</td>"
+            f"<td>{html_escape(str(summary['result_count']))}</td>"
+            f"<td><a href=\"{html_escape(str(outputs.get('json', '-')), quote=True)}\">json</a></td>"
+            f"<td><a href=\"{html_escape(str(outputs.get('html', '-')), quote=True)}\">html</a></td>"
+            f"<td><a href=\"{html_escape(str(outputs.get('md', '-')), quote=True)}\">md</a></td>"
+            f"<td><a href=\"{html_escape(str(outputs.get('csv', '-')), quote=True)}\">csv</a></td>"
+            "</tr>"
+        )
+    html_lines += ["</tbody>", "</table>", "</body>", "</html>"]
+    (job.out_dir / "result.html").write_text("\n".join(html_lines) + "\n", encoding="utf-8")
+
+    md_lines = [
+        "# FFUF Recursive Subscans",
+        "",
+        f"Job: {job.name}",
+        f"Aggregated results: {len(aggregated_results)}",
+        "",
+        "| # | Seed URL | State | Hits | JSON | HTML | MD | CSV |",
+        "| ---: | --- | --- | ---: | --- | --- | --- | --- |",
+    ]
+    for summary in subscan_summaries:
+        outputs = summary["outputs"]
+        outputs = outputs if isinstance(outputs, dict) else {}
+        md_lines.append(
+            "| {index} | {seed} | {state} | {hits} | {json_path} | {html_path} | {md_path} | {csv_path} |".format(
+                index=summary["index"],
+                seed=summary["seed_url"],
+                state=summary["state"],
+                hits=summary["result_count"],
+                json_path=outputs.get("json", "-"),
+                html_path=outputs.get("html", "-"),
+                md_path=outputs.get("md", "-"),
+                csv_path=outputs.get("csv", "-"),
+            )
+        )
+    (job.out_dir / "result.md").write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer)
+    writer.writerow(["subscan", "seed_url", "url", "status", "length", "words", "lines", "content-type", "redirectlocation"])
+    for summary, subscan in zip(subscan_summaries, job.subscans):
+        for item in read_ffuf_result_items(subscan.out_dir / "result.json"):
+            writer.writerow(
+                [
+                    summary["index"],
+                    subscan.seed_url,
+                    result_url(item),
+                    scalar_text(result_value(item, "status", "status_code", "StatusCode")),
+                    scalar_text(result_value(item, "length", "size", "content_length", "ContentLength")),
+                    scalar_text(result_value(item, "words", "content_words", "ContentWords")),
+                    scalar_text(result_value(item, "lines", "content_lines", "ContentLines")),
+                    scalar_text(result_value(item, "content-type", "content_type", "ContentType")),
+                    scalar_text(result_value(item, "redirectlocation", "redirect", "RedirectLocation")),
+                ]
+            )
+    (job.out_dir / "result.csv").write_text(csv_buffer.getvalue(), encoding="utf-8")
+
+
 def collect_unique_result_rows(
     output_root: Path,
     summaries: list[dict[str, object]],
@@ -1331,26 +1644,74 @@ def prepare_job(job_spec: JobSpec, args: argparse.Namespace, extensions: list[st
     seeds_file = out_dir / "paths.txt"
     seeds_file.write_text("\n".join(job_spec.seed_urls) + "\n", encoding="utf-8")
     recursion_depth = getattr(args, "recursion_depth", 0)
-    base_url = job_spec.seed_urls[0] if recursion_depth > 0 and len(job_spec.seed_urls) == 1 else None
+    headers = getattr(args, "headers", None) or []
+    recursion_strategy = getattr(args, "recursion_strategy", "default")
+    subscans: list[FfufSubscan] = []
 
-    cmd = build_ffuf_cmd(
-        seeds_file=seeds_file,
-        wordlist=args.wordlist,
-        out_dir=out_dir,
-        rate=args.rate,
-        headers=args.headers or [],
-        proxy=args.proxy,
-        extensions=extensions,
-        follow_redirects=args.follow_redirects,
-        recursion_depth=recursion_depth,
-        recursion_strategy=getattr(args, "recursion_strategy", "default"),
-        base_url=base_url,
-    )
-    command_text = shlex.join(cmd)
+    if recursion_depth > 0 and len(job_spec.seed_urls) > 1:
+        subscan_root = out_dir / "subscans"
+        subscan_root.mkdir(parents=True, exist_ok=True)
+        single_seed_total = estimate_single_seed_requests(args.wordlist, extensions)
+        used_subscan_names: set[str] = set()
+        for index, seed_url in enumerate(job_spec.seed_urls, start=1):
+            base_name = f"{index:03d}_{seed_slug(seed_url)}"
+            subscan_name = base_name
+            if subscan_name in used_subscan_names:
+                subscan_name = f"{base_name}_{sha256_text(seed_url)[:8]}"
+            used_subscan_names.add(subscan_name)
+            subscan_out_dir = subscan_root / subscan_name
+            subscan_out_dir.mkdir(parents=True, exist_ok=True)
+            subscan_cmd = build_ffuf_cmd(
+                seeds_file=seeds_file,
+                wordlist=args.wordlist,
+                out_dir=subscan_out_dir,
+                rate=args.rate,
+                headers=headers,
+                proxy=args.proxy,
+                extensions=extensions,
+                follow_redirects=args.follow_redirects,
+                recursion_depth=recursion_depth,
+                recursion_strategy=recursion_strategy,
+                base_url=seed_url,
+            )
+            subscans.append(
+                FfufSubscan(
+                    index=index,
+                    total=len(job_spec.seed_urls),
+                    seed_url=seed_url,
+                    out_dir=subscan_out_dir,
+                    cmd=subscan_cmd,
+                    command_text=shlex.join(subscan_cmd),
+                    estimated_total=single_seed_total,
+                )
+            )
+        commands = [subscan.cmd for subscan in subscans]
+        cmd = commands[0]
+        total = single_seed_total * len(subscans)
+        subscan_totals = [subscan.estimated_total for subscan in subscans]
+    else:
+        base_url = job_spec.seed_urls[0] if recursion_depth > 0 and len(job_spec.seed_urls) == 1 else None
+        cmd = build_ffuf_cmd(
+            seeds_file=seeds_file,
+            wordlist=args.wordlist,
+            out_dir=out_dir,
+            rate=args.rate,
+            headers=headers,
+            proxy=args.proxy,
+            extensions=extensions,
+            follow_redirects=args.follow_redirects,
+            recursion_depth=recursion_depth,
+            recursion_strategy=recursion_strategy,
+            base_url=base_url,
+        )
+        commands = [cmd]
+        total = estimate_single_seed_requests(args.wordlist, extensions) if base_url else estimate_total_requests(seeds_file, args.wordlist, extensions)
+        subscan_totals = []
+
+    command_text = "\n".join(shell_lines(commands))
     (out_dir / "command.txt").write_text(command_text + "\n", encoding="utf-8")
     hashes = build_job_hashes(seeds_file=seeds_file, wordlist=args.wordlist, command_text=command_text)
 
-    total = estimate_total_requests(seeds_file, args.wordlist, extensions)
     return FfufJob(
         job_id=job_id,
         name=job_spec.name,
@@ -1363,6 +1724,9 @@ def prepare_job(job_spec: JobSpec, args: argparse.Namespace, extensions: list[st
         hashes=hashes,
         stderr_log=out_dir / "ffuf.stderr.log",
         stop_aliases=build_stop_aliases(job_spec.name, job_spec.seed_urls),
+        subscans=subscans,
+        subscan_total_count=max(1, len(subscans)),
+        subscan_totals=subscan_totals,
     )
 
 
@@ -1554,6 +1918,14 @@ def main(argv: list[str] | None = None) -> int:
         print("Error: --recursion-depth must be 0 or greater.", file=sys.stderr)
         return 1
 
+    if args.recursion_depth > 0 and args.recursion_strategy == "default" and args.follow_redirects:
+        print(
+            "Error: -fr/--follow-redirects cannot be used with --recursion-strategy default because "
+            "ffuf default recursion relies on redirects. Remove -fr or use -rs greedy.",
+            file=sys.stderr,
+        )
+        return 1
+
     args.output_dir = Path(str(args.output_dir)).expanduser()
     args.wordlist = Path(str(args.wordlist)).expanduser()
     if args.input is not None:
@@ -1580,9 +1952,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         specs = build_specs_from_paths_dir(args.paths_dir)
 
-    if args.recursion_depth > 0:
-        specs = split_specs_for_native_recursion(specs)
-
     if not specs:
         print("Error: No usable ffuf jobs were built from the provided input.", file=sys.stderr)
         return 1
@@ -1606,7 +1975,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.show_cmds:
         for job in jobs:
-            print("$ " + shlex.join(job.cmd))
+            for command in job_commands(job):
+                print("$ " + shlex.join(command))
 
     if not jobs:
         write_index_files(args.output_dir, summaries)
@@ -1696,6 +2066,7 @@ def main(argv: list[str] | None = None) -> int:
                                 other.finished = True
                                 other.failed = True
                                 other.duration_seconds = max(0.0, time.time() - other.started)
+                                aggregate_recursive_subscan_outputs(other)
                                 other.result_count = read_result_count(other.out_dir / "result.json")
                                 running.remove(other)
                                 finished.append(other)
