@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 PROJECT_NAME = "simplescripts"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 SUMMARY = "Collection of offensive-security and utility scripts from the SimpleScripts repository."
 REQUIRES_PYTHON = ">=3.10"
 LICENSE = "MIT"
@@ -37,6 +37,7 @@ SCRIPT_SPECS = [
     ("AD/NTLMDecoder.py", "NTLMDecoder.py"),
     ("AD/PowerShellPayload.py", "PowerShellPayload.py"),
     ("AD/WeakPassHunter.py", "WeakPassHunter.py"),
+    ("AD/ntdssplit.py", "ntdssplit.py"),
     ("AD_PS/EncodeAssembly.ps1", "EncodeAssembly.ps1"),
     ("AD_PS/FindSPNAccounts.ps1", "FindSPNAccounts.ps1"),
     ("AD_PS/SearchRBCD.ps1", "SearchRBCD.ps1"),

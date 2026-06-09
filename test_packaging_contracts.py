@@ -51,6 +51,9 @@ class PackagingContractsTests(unittest.TestCase):
 
             with zipfile.ZipFile(wheels[0]) as archive:
                 names = set(archive.namelist())
+                entry_points = archive.read(
+                    f"simplescripts-{packaging_backend.VERSION}.dist-info/entry_points.txt"
+                ).decode("utf-8")
 
             self.assertIn(
                 f"simplescripts-{packaging_backend.VERSION}.dist-info/entry_points.txt",
@@ -72,6 +75,11 @@ class PackagingContractsTests(unittest.TestCase):
                 "simplescripts_scripts/Scanners/nmap_to_ip.py",
                 names,
             )
+            self.assertIn(
+                "simplescripts_scripts/AD/ntdssplit.py",
+                names,
+            )
+            self.assertIn("ntdssplit.py = simplescripts_launcher:main", entry_points)
 
 
 if __name__ == "__main__":
