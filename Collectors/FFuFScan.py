@@ -1559,12 +1559,18 @@ def write_unique_paths_html(output_root: Path, summaries: list[dict[str, object]
         "table { width: 100%; border-collapse: collapse; table-layout: fixed; }",
         "th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }",
         "th { color: #344054; background: #fafbfc; font-size: 12px; text-transform: uppercase; letter-spacing: 0; }",
+        "th.sortable { padding: 0; }",
+        ".sort-btn { width: 100%; min-height: 36px; padding: 9px 10px; border: 0; background: transparent; color: inherit; font: inherit; text-transform: inherit; text-align: left; cursor: pointer; display: flex; align-items: center; gap: 6px; }",
+        ".sort-btn:hover { background: #eef2f7; }",
+        ".sort-mark { color: var(--accent); font-weight: 700; text-transform: none; }",
+        ".reset-sort { margin-left: 10px; border: 1px solid var(--line); background: #fff; color: #344054; border-radius: 6px; padding: 4px 8px; cursor: pointer; font: inherit; font-size: 12px; }",
+        ".reset-sort:hover { border-color: var(--accent); color: var(--accent); }",
         "tr:last-child td { border-bottom: 0; }",
         "a { color: var(--accent); text-decoration: none; }",
         "a:hover { text-decoration: underline; }",
         ".num { width: 90px; white-space: nowrap; }",
-        ".path { width: 28%; overflow-wrap: anywhere; }",
-        ".url { width: 34%; overflow-wrap: anywhere; }",
+        ".path { width: 23%; overflow-wrap: anywhere; }",
+        ".url { width: 33%; overflow-wrap: anywhere; }",
         ".small { width: 120px; overflow-wrap: anywhere; }",
         ".empty { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; color: var(--muted); }",
         "</style>",
@@ -1591,38 +1597,42 @@ def write_unique_paths_html(output_root: Path, summaries: list[dict[str, object]
             rows = grouped[host]
             lines += [
                 "<section>",
-                f"<h2>{html_escape(host)} <span class=\"count\">({len(rows)})</span></h2>",
+                f"<h2>{html_escape(host)} <span class=\"count\">({len(rows)})</span><button class=\"reset-sort\" type=\"button\">Reset sort</button></h2>",
                 '<div class="table-wrap">',
-                "<table>",
+                '<table data-host-table="1">',
                 "<thead>",
                 "<tr>",
-                '<th class="num">Status</th>',
-                '<th class="num">Size</th>',
-                '<th class="path">Path</th>',
                 '<th class="url">URL</th>',
-                '<th class="num">Words</th>',
+                '<th class="path">Path</th>',
+                '<th class="num sortable"><button class="sort-btn" type="button" data-sort-key="status">Status <span class="sort-mark"></span></button></th>',
+                '<th class="num sortable"><button class="sort-btn" type="button" data-sort-key="size">Size <span class="sort-mark"></span></button></th>',
+                '<th class="num sortable"><button class="sort-btn" type="button" data-sort-key="words">Words <span class="sort-mark"></span></button></th>',
                 '<th class="num">Lines</th>',
-                '<th class="small">Content-Type</th>',
                 '<th class="small">Redirect</th>',
+                '<th class="small">Content-Type</th>',
                 "</tr>",
                 "</thead>",
                 "<tbody>",
             ]
-            for row in rows:
+            for index, row in enumerate(rows):
                 url = row["url"]
                 url_cell = html_escape(url)
                 if url != "-":
                     url_cell = f'<a href="{html_escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">{url_cell}</a>'
                 lines.append(
-                    "<tr>"
+                    "<tr "
+                    f'data-index="{index}" '
+                    f'data-status="{html_escape(row["status"], quote=True)}" '
+                    f'data-size="{html_escape(row["size"], quote=True)}" '
+                    f'data-words="{html_escape(row["words"], quote=True)}">'
+                    f'<td class="url">{url_cell}</td>'
+                    f'<td class="path">{html_escape(row["path"])}</td>'
                     f'<td class="num">{html_escape(row["status"])}</td>'
                     f'<td class="num">{html_escape(row["size"])}</td>'
-                    f'<td class="path">{html_escape(row["path"])}</td>'
-                    f'<td class="url">{url_cell}</td>'
                     f'<td class="num">{html_escape(row["words"])}</td>'
                     f'<td class="num">{html_escape(row["lines"])}</td>'
-                    f'<td class="small">{html_escape(row["content_type"])}</td>'
                     f'<td class="small">{html_escape(row["redirect"])}</td>'
+                    f'<td class="small">{html_escape(row["content_type"])}</td>'
                     "</tr>"
                 )
             lines += [
@@ -1632,7 +1642,73 @@ def write_unique_paths_html(output_root: Path, summaries: list[dict[str, object]
                 "</section>",
             ]
 
-    lines += ["</main>", "</body>", "</html>"]
+    lines += [
+        "</main>",
+        "<script>",
+        "(function () {",
+        "  function readNumber(row, key) {",
+        "    var raw = row.dataset[key] || '';",
+        "    var value = Number(raw);",
+        "    return Number.isFinite(value) ? value : null;",
+        "  }",
+        "  function compareRows(a, b, sorts) {",
+        "    for (var i = 0; i < sorts.length; i += 1) {",
+        "      var sort = sorts[i];",
+        "      var av = readNumber(a, sort.key);",
+        "      var bv = readNumber(b, sort.key);",
+        "      if (av === null && bv === null) { continue; }",
+        "      if (av === null) { return 1; }",
+        "      if (bv === null) { return -1; }",
+        "      if (av !== bv) { return sort.dir === 'asc' ? av - bv : bv - av; }",
+        "    }",
+        "    return Number(a.dataset.index || 0) - Number(b.dataset.index || 0);",
+        "  }",
+        "  function renderMarks(table, sorts) {",
+        "    table.querySelectorAll('.sort-btn').forEach(function (button) {",
+        "      var key = button.dataset.sortKey;",
+        "      var mark = button.querySelector('.sort-mark');",
+        "      var index = sorts.findIndex(function (item) { return item.key === key; });",
+        "      mark.textContent = index === -1 ? '' : String(index + 1) + (sorts[index].dir === 'asc' ? ' up' : ' down');",
+        "    });",
+        "  }",
+        "  function applySort(table) {",
+        "    var sorts = table._ffufSorts || [];",
+        "    var tbody = table.tBodies[0];",
+        "    var rows = Array.prototype.slice.call(tbody.rows);",
+        "    rows.sort(function (a, b) { return compareRows(a, b, sorts); });",
+        "    rows.forEach(function (row) { tbody.appendChild(row); });",
+        "    renderMarks(table, sorts);",
+        "  }",
+        "  document.querySelectorAll('table[data-host-table]').forEach(function (table) {",
+        "    table._ffufSorts = [];",
+        "    table.querySelectorAll('.sort-btn').forEach(function (button) {",
+        "      button.addEventListener('click', function () {",
+        "        var key = button.dataset.sortKey;",
+        "        var sorts = table._ffufSorts;",
+        "        var index = sorts.findIndex(function (item) { return item.key === key; });",
+        "        if (index === -1) {",
+        "          sorts.push({ key: key, dir: 'asc' });",
+        "        } else if (sorts[index].dir === 'asc') {",
+        "          sorts[index].dir = 'desc';",
+        "        } else {",
+        "          sorts.splice(index, 1);",
+        "        }",
+        "        applySort(table);",
+        "      });",
+        "    });",
+        "    var reset = table.closest('section').querySelector('.reset-sort');",
+        "    if (reset) {",
+        "      reset.addEventListener('click', function () {",
+        "        table._ffufSorts = [];",
+        "        applySort(table);",
+        "      });",
+        "    }",
+        "  });",
+        "}());",
+        "</script>",
+        "</body>",
+        "</html>",
+    ]
     (output_root / "unique_paths.html").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
