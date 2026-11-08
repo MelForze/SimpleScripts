@@ -129,14 +129,14 @@ def generate_command(protocol: str, ports: set[int]) -> str:
     if protocol == "udp":
         return (
             "sudo nmap -Pn -n -sUV --version-all --open "
-            f"-p {ports_str} -v --webxml -oA nmap/nmap_result_udp -iL domains.txt"
+            f"-p {ports_str} -v --webxml -oA nmap/nmap_result_udp -iL alive_ips4.txt"
         )
 
     return (
         "sudo nmap -Pn -n -sSV --version-all --open "
         f"-p {ports_str} --min-rate 4999 --max-rate 5000 --max-retries 1 "
         "--min-rtt-timeout 50ms --max-rtt-timeout 150ms "
-        "-v --webxml -oA nmap/nmap_result -iL domains.txt"
+        "-v --webxml -oA nmap/nmap_result -iL alive_ips4.txt"
     )
 
 
