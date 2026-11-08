@@ -22,6 +22,8 @@ KATANA_BASE_OPTS = [
     "5",
     "-crawl-scope",
     None,
+    "-field-scope",
+    "fqdn",
     "-js-crawl",
     "-jsluice",
     "-crawl-duration",
@@ -98,6 +100,27 @@ def origin_from_url(url: str) -> str:
     host = f"[{hostname}]" if ":" in hostname else hostname
     netloc = host if parsed.port is None else f"{host}:{parsed.port}"
     return urlunsplit((parsed.scheme, netloc, "/", "", ""))
+
+
+def origin_scope_pattern(url: str) -> str:
+    """Match only this origin, including explicit spellings of default ports."""
+    parsed = urlsplit(origin_from_url(url))
+    authority = re.escape(f"{parsed.scheme}://{parsed.netloc}")
+    default_port = ""
+    if parsed.port is None:
+        default_port = ":80" if parsed.scheme == "http" else ":443"
+        default_port = f"({default_port})?"
+    # Limit case folding to the scheme and host. A delimiter prevents matching
+    # host/port prefixes or an origin embedded in another URL's path or query.
+    return f"^(?i:{authority}){default_port}([/?#]|$)"
+
+
+def build_crawl_seeds(urls: list[str]) -> list[str]:
+    """Start at each origin root once and retain all explicitly supplied pages."""
+    seeds: list[str] = []
+    for url in urls:
+        seeds.extend((origin_from_url(url), url))
+    return dedupe_preserve_order(seeds)
 
 
 def sanitize_origin_filename(origin: str) -> str:
@@ -249,7 +272,7 @@ def build_katana_command(
 ) -> list[str]:
     """Build a katana command with shared options for normal and DAST runs."""
     cmd = ["katana", "-u", url] + KATANA_BASE_OPTS.copy()
-    cmd[cmd.index("-crawl-scope") + 1] = url
+    cmd[cmd.index("-crawl-scope") + 1] = origin_scope_pattern(url)
 
     if proxy:
         cmd += ["-proxy", proxy]
@@ -314,7 +337,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--input",
         type=Path,
         required=True,
-        help="File with URLs (one per line).",
+        help=(
+            "File with URLs (one per line). Crawl each exact origin "
+            "(scheme, host, port), starting at its root and the supplied URLs."
+        ),
     )
     parser.add_argument(
         "-o",
@@ -429,6 +455,7 @@ def main(argv=None) -> int:
         print("[!] No valid URLs to process.", file=sys.stderr)
         return 1
 
+    urls = build_crawl_seeds(urls)
     output_root = args.output_dir
 
     if args.dast:

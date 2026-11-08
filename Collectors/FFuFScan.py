@@ -464,14 +464,15 @@ def build_specs_from_url_file(path: Path) -> list[JobSpec]:
 
 
 def read_paths_file(path: Path) -> list[str]:
-    """Read and normalize seed URLs from a Katana paths file."""
+    """Read Katana directory URLs with a trailing slash for URLFUZZ joining."""
     urls: list[str] = []
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         try:
-            urls.append(normalize_url(stripped))
+            normalized = normalize_url(stripped)
+            urls.append(normalized.rstrip("/") + "/")
         except ValueError as exc:
             print(
                 f"Warning: skipping invalid URL in {path.name}:{line_number}: {stripped} ({exc})",
@@ -1494,9 +1495,9 @@ def collect_unique_result_rows(
     output_root: Path,
     summaries: list[dict[str, object]],
 ) -> dict[str, list[dict[str, str]]]:
-    """Collect first ffuf result per host/status/size for manual review."""
+    """Collect first ffuf result per host/status/size/words for manual review."""
     grouped: dict[str, list[dict[str, str]]] = {}
-    seen_by_host: dict[str, set[tuple[str, str]]] = {}
+    seen_by_host: dict[str, set[tuple[str, str, str]]] = {}
 
     for summary in sorted(summaries, key=lambda item: str(item.get("name", ""))):
         result_json = summary_result_json_path(output_root, summary)
@@ -1510,7 +1511,8 @@ def collect_unique_result_rows(
             path = path_from_result_url(url)
             status = scalar_text(result_value(item, "status", "status_code", "StatusCode"))
             size = scalar_text(result_value(item, "length", "size", "content_length", "ContentLength"))
-            key = (status, size)
+            words = scalar_text(result_value(item, "words", "content_words", "ContentWords"))
+            key = (status, size, words)
             seen = seen_by_host.setdefault(host, set())
             if key in seen:
                 continue
@@ -1521,7 +1523,7 @@ def collect_unique_result_rows(
                     "size": size,
                     "path": path,
                     "url": url,
-                    "words": scalar_text(result_value(item, "words", "content_words", "ContentWords")),
+                    "words": words,
                     "lines": scalar_text(result_value(item, "lines", "content_lines", "ContentLines")),
                     "content_type": scalar_text(result_value(item, "content-type", "content_type", "ContentType")),
                     "redirect": scalar_text(result_value(item, "redirectlocation", "redirect", "RedirectLocation")),
@@ -1584,7 +1586,7 @@ def write_unique_paths_html(output_root: Path, summaries: list[dict[str, object]
             f"<span>Generated: {html_escape(generated_at)}</span>"
             f"<span>Hosts: {len(grouped)}</span>"
             f"<span>Unique rows: {total_rows}</span>"
-            "<span>Uniqueness: host + status + size</span>"
+            "<span>Uniqueness: host:port + status + size + words</span>"
             "</div>"
         ),
         "</header>",
@@ -1806,6 +1808,22 @@ def prepare_job(job_spec: JobSpec, args: argparse.Namespace, extensions: list[st
     )
 
 
+def parse_extensions(raw: str) -> list[str]:
+    """Normalize comma-separated extensions for ffuf's literal suffix expansion."""
+    extensions: list[str] = []
+    for item in raw.split(","):
+        extension = item.strip()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = "." + extension
+        extensions.append(extension)
+    extensions = dedupe_preserve_order(extensions)
+    if not extensions:
+        raise argparse.ArgumentTypeError("provide at least one extension, for example: php,bak or .php,.bak")
+    return extensions
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = create_argument_parser(
@@ -1829,7 +1847,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     source_group.add_argument(
         "--paths-dir",
         type=Path,
-        help="Directory with *_Katana.txt files from KatanaScan.py paths mode.",
+        help="Directory with *_Katana.txt files from KatanaScan.py paths mode. Entries are treated as directory URLs.",
     )
 
     parser.add_argument(
@@ -1863,9 +1881,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-e",
         "--extensions",
-        type=str,
+        type=parse_extensions,
         default=None,
-        help="Comma-separated extension list for ffuf -e, for example: php,asp,aspx",
+        help=(
+            "Comma-separated extensions, for example: .php,.asp,.aspx. "
+            "Leading dots are optional; duplicate extensions are removed (case-sensitive)."
+        ),
     )
     parser.add_argument(
         "-H",
@@ -2032,7 +2053,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Error: No usable ffuf jobs were built from the provided input.", file=sys.stderr)
         return 1
 
-    extensions = [item.strip() for item in args.extensions.split(",") if item.strip()] if args.extensions else None
+    extensions = args.extensions
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
