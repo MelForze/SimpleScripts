@@ -3,6 +3,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -44,6 +45,28 @@ def create_argument_parser(*args, **kwargs) -> argparse.ArgumentParser:
         return argparse.ArgumentParser(*args, color=False, **kwargs)
     except TypeError:
         return argparse.ArgumentParser(*args, **kwargs)
+
+
+def parse_user_agent(raw: str) -> str:
+    """Validate an explicit User-Agent value without accepting control characters."""
+    if not raw.strip() or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        raise argparse.ArgumentTypeError("User-Agent must be non-empty and contain no control characters")
+    return raw.strip()
+
+
+def headers_with_user_agent(headers: list[str] | None, user_agent: str | None) -> list[str] | None:
+    """Add one canonical UA header, rejecting conflicting explicit values."""
+    if user_agent is None:
+        return headers
+    merged: list[str] = []
+    for header in headers or []:
+        name, separator, value = header.partition(":")
+        if name.strip().lower() == "user-agent":
+            if not separator or value.strip() != user_agent:
+                raise ValueError("--user-agent conflicts with a User-Agent supplied through --header")
+        else:
+            merged.append(header)
+    return merged + [f"User-Agent: {user_agent}"]
 
 
 def normalize_url(url: str) -> str:
@@ -284,7 +307,13 @@ def build_katana_command(
         cmd += ["-jsonl", "-aff", "-iqp"]
 
     if use_headless:
-        cmd.append("-headless")
+        # Katana v1.8's pure headless engine overwrites Chrome's launch-time UA
+        # with Rod's default device. Hybrid explicitly applies -H to the page.
+        has_custom_ua = any(
+            header.partition(":")[0].strip().lower() == "user-agent" and ":" in header
+            for header in headers or []
+        )
+        cmd.append("-hybrid" if has_custom_ua else "-headless")
 
     if extra_opts:
         cmd += extra_opts
@@ -390,13 +419,29 @@ def parse_args(argv=None) -> argparse.Namespace:
         help='Additional request header, repeat as needed. Example: --header "Authorization: Bearer XXX"',
     )
     parser.add_argument(
+        "-ua",
+        "--user-agent",
+        type=parse_user_agent,
+        help="User-Agent for HTTP requests and Chrome (uses hybrid with --browser). Default: katana's own value.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate inputs and print commands/output paths without running katana or writing files.",
+    )
+    parser.add_argument(
         "-b",
         "--browser",
         action="store_true",
         help="Enable headless browsing mode.",
     )
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    try:
+        args.headers = headers_with_user_agent(args.headers, args.user_agent)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def resolve_selected_modes(args: argparse.Namespace) -> list[str]:
@@ -460,10 +505,16 @@ def main(argv=None) -> int:
 
     if args.dast:
         if args.dast_output is None:
-            output_root.mkdir(parents=True, exist_ok=True)
             dast_output = output_root / "katana-dast.jsonl"
         else:
             dast_output = args.dast_output
+
+        if args.dry_run:
+            print(f"# Dry run: {len(urls)} commands; merged DAST output: {dast_output}")
+            for url in urls:
+                cmd = build_katana_command(url, args.browser, args.proxy, args.headers, is_dast=True)
+                print("$ " + shlex.join(cmd))
+            return 0
 
         dast_output.parent.mkdir(parents=True, exist_ok=True)
         failures: list[str] = []
@@ -515,10 +566,6 @@ def main(argv=None) -> int:
     group_remaining: dict[tuple[str, str], int] = {}
     group_results: dict[tuple[str, str], list[list[str]]] = {}
 
-    for mode in selected_modes:
-        mode_dir = output_root / str(MODE_CONFIG[mode]["directory"])
-        mode_dir.mkdir(parents=True, exist_ok=True)
-
     for origin, seed_urls in grouped_urls.items():
         for mode in selected_modes:
             mode_dir = output_root / str(MODE_CONFIG[mode]["directory"])
@@ -530,6 +577,20 @@ def main(argv=None) -> int:
             group_results[group_key] = []
             for url in seed_urls:
                 tasks.append((mode, origin, url, mode_dir, extra_opts))
+
+    if args.dry_run:
+        print(f"# Dry run: {len(tasks)} commands; workers={args.workers}")
+        for mode, origin, url, mode_dir, extra_opts in tasks:
+            final = mode_dir / f"{sanitize_origin_filename(origin)}_Katana.txt"
+            temp = mode_dir / f"{sanitize_filename(url)}_active.txt"
+            print(f"# {mode}: merge into {final}")
+            cmd = build_katana_command(url, args.browser, args.proxy, args.headers, extra_opts)
+            print("$ " + shlex.join(cmd) + " > " + shlex.quote(str(temp)))
+        return 0
+
+    for mode in selected_modes:
+        mode_dir = output_root / str(MODE_CONFIG[mode]["directory"])
+        mode_dir.mkdir(parents=True, exist_ok=True)
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         future_to_item = {

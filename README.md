@@ -30,6 +30,28 @@ To refresh an existing installation from the repository:
 pipx upgrade simplescripts
 ```
 
+## Collectors
+
+Both collectors accept `--user-agent` (or `-ua`) and `--dry-run`:
+
+```bash
+KatanaScan.py -i targets.txt -m everything --user-agent "MyAudit/1.0" --dry-run
+FFuFScan.py --paths-dir katana/paths -w words.txt --user-agent "MyAudit/1.0" --dry-run
+```
+
+Remove `--dry-run` to run the commands. Dry runs validate inputs and print commands
+and output paths without starting the tools or creating/modifying result files.
+FFuFScan also prints planned seed-file contents and checks `--resume` state without
+changing it. The underlying binaries are not required for a dry run.
+
+Without `--user-agent`, the tools keep their own defaults. Explicit UA values must
+be non-empty and agree with any `User-Agent` passed through `--header`.
+With a custom UA, KatanaScan uses Katana's hybrid browser engine for `--browser`:
+the v1.8.0 pure headless engine overwrites Chromium's launch-time UA with a default
+device profile. Without a custom UA, `--browser` keeps using the headless engine.
+In Katana v1.8.0, the built-in robots.txt/sitemap.xml fetchers set their own UA
+independently.
+
 ## To Do
 
 - [x] **Create Wildcard Hunter Script**  

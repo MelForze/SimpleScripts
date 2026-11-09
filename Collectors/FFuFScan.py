@@ -42,6 +42,28 @@ def create_argument_parser(*args, **kwargs) -> argparse.ArgumentParser:
         return argparse.ArgumentParser(*args, **kwargs)
 
 
+def parse_user_agent(raw: str) -> str:
+    """Validate an explicit User-Agent value without accepting control characters."""
+    if not raw.strip() or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        raise argparse.ArgumentTypeError("User-Agent must be non-empty and contain no control characters")
+    return raw.strip()
+
+
+def headers_with_user_agent(headers: list[str] | None, user_agent: str | None) -> list[str] | None:
+    """Add one canonical UA header, rejecting conflicting explicit values."""
+    if user_agent is None:
+        return headers
+    merged: list[str] = []
+    for header in headers or []:
+        name, separator, value = header.partition(":")
+        if name.strip().lower() == "user-agent":
+            if not separator or value.strip() != user_agent:
+                raise ValueError("--user-agent conflicts with a User-Agent supplied through --header")
+        else:
+            merged.append(header)
+    return merged + [f"User-Agent: {user_agent}"]
+
+
 def normalize_url(raw: str) -> str:
     """Normalize an HTTP(S) URL for origin grouping and ffuf seeding."""
     value = raw.strip()
@@ -269,10 +291,12 @@ def read_ffuf_stderr_diagnostics(path: Path) -> dict[str, int | None]:
         }
 
 
-def build_job_hashes(seeds_file: Path, wordlist: Path, command_text: str) -> dict[str, str]:
+def build_job_hashes(
+    seeds_file: Path, wordlist: Path, command_text: str, *, seeds_text: str | None = None,
+) -> dict[str, str]:
     """Build the resume-relevant hashes for a job."""
     return {
-        "paths_sha256": sha256_file(seeds_file),
+        "paths_sha256": sha256_file(seeds_file) if seeds_text is None else sha256_text(seeds_text),
         "wordlist_sha256": sha256_file(wordlist),
         "command_sha256": sha256_text(command_text),
     }
@@ -1714,13 +1738,17 @@ def write_unique_paths_html(output_root: Path, summaries: list[dict[str, object]
     (output_root / "unique_paths.html").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def prepare_job(job_spec: JobSpec, args: argparse.Namespace, extensions: list[str] | None, job_id: int = 0) -> FfufJob:
-    """Create job files and runtime metadata."""
+def prepare_job(
+    job_spec: JobSpec, args: argparse.Namespace, extensions: list[str] | None, job_id: int = 0,
+    *, write_files: bool = True,
+) -> FfufJob:
+    """Build job metadata, optionally creating the files needed to run it."""
     out_dir = args.output_dir / job_spec.name
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     seeds_file = out_dir / "paths.txt"
-    seeds_file.write_text("\n".join(job_spec.seed_urls) + "\n", encoding="utf-8")
+    seeds_text = "\n".join(job_spec.seed_urls) + "\n"
+    if write_files:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        seeds_file.write_text(seeds_text, encoding="utf-8")
     recursion_depth = getattr(args, "recursion_depth", 0)
     headers = getattr(args, "headers", None) or []
     recursion_strategy = getattr(args, "recursion_strategy", "default")
@@ -1728,7 +1756,6 @@ def prepare_job(job_spec: JobSpec, args: argparse.Namespace, extensions: list[st
 
     if recursion_depth > 0 and len(job_spec.seed_urls) > 1:
         subscan_root = out_dir / "subscans"
-        subscan_root.mkdir(parents=True, exist_ok=True)
         single_seed_total = estimate_single_seed_requests(args.wordlist, extensions)
         used_subscan_names: set[str] = set()
         for index, seed_url in enumerate(job_spec.seed_urls, start=1):
@@ -1738,7 +1765,8 @@ def prepare_job(job_spec: JobSpec, args: argparse.Namespace, extensions: list[st
                 subscan_name = f"{base_name}_{sha256_text(seed_url)[:8]}"
             used_subscan_names.add(subscan_name)
             subscan_out_dir = subscan_root / subscan_name
-            subscan_out_dir.mkdir(parents=True, exist_ok=True)
+            if write_files:
+                subscan_out_dir.mkdir(parents=True, exist_ok=True)
             subscan_cmd = build_ffuf_cmd(
                 seeds_file=seeds_file,
                 wordlist=args.wordlist,
@@ -1783,12 +1811,16 @@ def prepare_job(job_spec: JobSpec, args: argparse.Namespace, extensions: list[st
             base_url=base_url,
         )
         commands = [cmd]
-        total = estimate_single_seed_requests(args.wordlist, extensions) if base_url else estimate_total_requests(seeds_file, args.wordlist, extensions)
+        total = estimate_single_seed_requests(args.wordlist, extensions) * len(job_spec.seed_urls)
         subscan_totals = []
 
     command_text = "\n".join(shell_lines(commands))
-    (out_dir / "command.txt").write_text(command_text + "\n", encoding="utf-8")
-    hashes = build_job_hashes(seeds_file=seeds_file, wordlist=args.wordlist, command_text=command_text)
+    if write_files:
+        (out_dir / "command.txt").write_text(command_text + "\n", encoding="utf-8")
+    hashes = build_job_hashes(
+        seeds_file=seeds_file, wordlist=args.wordlist, command_text=command_text,
+        seeds_text=seeds_text.replace("\n", os.linesep) if not write_files else None,
+    )
 
     return FfufJob(
         job_id=job_id,
@@ -1897,6 +1929,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Additional ffuf header, repeat as needed. Example: -H "Cookie: name=value"',
     )
     parser.add_argument(
+        "-ua",
+        "--user-agent",
+        type=parse_user_agent,
+        help="User-Agent for HTTP requests. Default: ffuf's own value.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate inputs and print commands/planned seed files without running ffuf or writing files.",
+    )
+    parser.add_argument(
         "--proxy",
         type=str,
         default=None,
@@ -1937,7 +1980,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Continue processing other jobs even if one ffuf job fails.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    try:
+        args.headers = headers_with_user_agent(args.headers, args.user_agent)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def render_status(
@@ -1999,7 +2047,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run parallel ffuf jobs from a URL file or Katana paths directory."""
     args = parse_args(argv)
 
-    if shutil.which("ffuf") is None:
+    if not args.dry_run and shutil.which("ffuf") is None:
         print("Error: 'ffuf' was not found in PATH.", file=sys.stderr)
         return 1
 
@@ -2055,20 +2103,39 @@ def main(argv: list[str] | None = None) -> int:
 
     extensions = args.extensions
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if not args.dry_run:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
 
     jobs: list[FfufJob] = []
     skipped_count = 0
     summaries: list[dict[str, object]] = []
     for job_id, spec in enumerate(specs, start=1):
-        job = prepare_job(spec, args, extensions, job_id=job_id)
+        job = prepare_job(spec, args, extensions, job_id=job_id, write_files=not args.dry_run)
         if args.resume:
             resumed_state = load_resume_state(job.out_dir, job.hashes)
             if resumed_state is not None:
                 summaries.append(resumed_state)
                 skipped_count += 1
+                if args.dry_run:
+                    print(f"# Skip {job.name}: matches --resume state")
                 continue
         jobs.append(job)
+        if args.dry_run:
+            print(f"# Job {job.job_id}: {job.name}; estimated base requests={job.total}")
+            print(f"# Planned seed file: {job.seeds_file}")
+            for seed_url in spec.seed_urls:
+                print(f"#   {seed_url}")
+            for command in job_commands(job):
+                print("$ " + shlex.join(command))
+
+    if args.dry_run:
+        print(
+            f"# Dry run: jobs={len(specs)} run={len(jobs)} skipped={skipped_count}; "
+            f"parallel={args.parallel} rate={args.rate}/job"
+        )
+        if args.recursion_depth:
+            print("# Recursive discovery can add requests beyond the base estimate.")
+        return 0
 
     if args.show_cmds:
         for job in jobs:
