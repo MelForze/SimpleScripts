@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 PROJECT_NAME = "simplescripts"
-VERSION = "1.0.12"
+VERSION = "1.0.17"
 SUMMARY = "Collection of offensive-security and utility scripts from the SimpleScripts repository."
 REQUIRES_PYTHON = ">=3.10"
 LICENSE = "MIT"
@@ -55,6 +55,7 @@ SCRIPT_SPECS = [
     ("Hunters/WildcardHunter.py", "WildcardHunter.py"),
     ("Collectors/KatanaScan.py", "KatanaScan.py"),
     ("Collectors/FFuFScan.py", "FFuFScan.py"),
+    ("Collectors/OSINTCollector.py", "OSINTCollector.py"),
     ("Mobile/PoC_Janus.py", "PoC_Janus.py"),
     ("Mobile/android_deeplinks.py", "android_deeplinks.py"),
     ("Mobile/android_activities.py", "android_activities.py"),

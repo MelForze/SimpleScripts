@@ -32,7 +32,7 @@ pipx upgrade simplescripts
 
 ## Collectors
 
-Both collectors accept `--user-agent` (or `-ua`) and `--dry-run`:
+KatanaScan and FFuFScan accept `--user-agent` (or `-ua`) and `--dry-run`:
 
 ```bash
 KatanaScan.py -i targets.txt -m everything --user-agent "MyAudit/1.0" --dry-run
@@ -110,6 +110,132 @@ verified completed passes without sending the requests again.
 `-fr` with `-rd > 0` and the default recursion strategy is rejected before any
 jobs start. Add `-rs greedy` explicitly to combine recursion with redirect
 following, or remove `-fr` to retain redirect-based directory recursion.
+
+### OSINT template runner
+
+`Collectors/OSINTCollector.py` executes the subdomain/DNS shell commands from
+`Pentest Template/Osint/Passive Actions.md` and `Active Actions.md` verbatim,
+in template order. The local Markdown files are required executable input;
+no commands, API keys or template contents are embedded in the Python script
+or bundled into the package. When installed with pipx, launch from a checkout
+containing the templates, or select their directory with `--templates`.
+
+From the repository root (`/Users/melforze/Desktop/vscode/SimpleScripts` in this
+checkout):
+
+```bash
+python3 Collectors/OSINTCollector.py --help
+python3 Collectors/OSINTCollector.py -i top_domains.txt --dry-run
+python3 Collectors/OSINTCollector.py -i top_domains.txt
+```
+
+Results default to the current launch directory; `-o` selects another result
+directory. The default is `--mode all`: passive collection first, then active collection.
+`--mode passive` and `--mode active` select one part. Domain-list command variants
+are used even for a single domain. Each root gets an isolated workspace with its
+own `top_domains.txt`; stages run source first across the roots, preserving the
+action order. The collector creates the `subdomains/` directory and copies
+`~/selflists/dns/resolvers.txt` into active workspaces as `resolvers.txt`. Other paths
+and all tool options retain their literal template values.
+
+Passive order: DNSDumpster → manual Subdomainfinder/Pentest-tool/Nmapper/SuIP
+entries (no commands supplied) → crt.sh → Subfinder → Findomain → Assetfinder →
+Docker BBOT → copy BBOT results. Active order: Docker BBOT → copy → PureDNS →
+copy PureDNS findings into `subdomains/` → prepare domain list → DNS records → SRV → extract hosts → IPv4-based PTR via
+`dnsx` → collect findings → prepare/run/collect AXFR → final domains →
+`host -t A` → unique IPv4 addresses. The single-domain, standalone-IP and
+`nets.txt` alternatives are not run in addition to the chosen list variants.
+Company research, leaks, code and job-site sections are outside this version.
+
+There are no collector-added rates, request retries, timeouts, host limits or
+UA overrides. In particular, `dnsx -rl 100`, the API-loop `sleep 2`, BBOT's
+`--platform linux/amd64 --rm -it --pull=always`, and PureDNS's wordlist path come
+from the templates themselves. AXFR is executed at its template position.
+BBOT requires an interactive terminal because its command retains `-it`.
+The template commands require Bash/POSIX tools; use macOS/Linux or a matching
+WSL environment. Install `curl`, `jq`, `subfinder`, `findomain`, `assetfinder`,
+Docker, `puredns`/`massdns`, `dig`, `dnsx`, `host` and the shell text tools.
+
+`--help` displays config paths and file existence without reading key contents:
+
+- Subfinder paths are taken from the installed `subfinder -h` when available,
+  respecting `SUBFINDER_CONFIG` and `SUBFINDER_PROVIDER_CONFIG`. Otherwise the
+  help displays an explicitly labelled estimate for macOS, Linux/XDG or
+  Windows/APPDATA. Fill the providers' API keys in `provider-config.yaml`;
+  `-all` is already present in the command. Keys, enabled sources and API plan
+  limits affect coverage. Use absolute paths for config environment overrides:
+  relative paths are resolved by Subfinder from its per-root workspace.
+- BBOT's exact Docker command mounts `$HOME/.config/bbot/secrets.yml` read-only
+  at `/root/.config/bbot/secrets.yml`. Put API keys there. Although native BBOT
+  also has `bbot.yml`, the template does **not** mount it; its host settings do
+  not reach this container. The collector never adds another mount or changes
+  the explicit path based on OS conventions.
+- Active collection uses `~/selflists/dns/biggest_dnslist.txt` and
+  `~/selflists/dns/resolvers.txt`. The help lists these required paths too.
+
+Use the same output directory when adding root domains. Completed stages are
+checked against output hashes and reused; new roots are collected separately.
+An interrupted/failed command is retried in a clean workspace with copies of
+verified earlier-stage outputs. Use `--refresh` after changing tool configs or
+keys, or to repeat collection. There is one writer per project. New checkpoints
+are in `.osint/template-state.json`; legacy `template-state.json` checkpoints
+are read if the new state file is absent. The earlier collector's `state.sqlite3` is not
+reused because its commands differed. Old data is not deleted.
+
+`--dry-run` prints a read-only plan without running tools or creating/modifying
+project files. API keys are redacted in progress/plans; the actual command is
+executed unchanged. Live tool output goes to the terminal, preserving BBOT's
+interactive operation. A nonzero shell exit or a missing expected output stops
+the run (exit 1); Ctrl+C returns 130 and preserves completed checkpoints.
+Pipeline exit semantics remain Bash defaults, just like the template: an
+upstream failure can be masked by a successful final pipeline command.
+
+Original command outputs remain under `.osint/runs/<root>/<phase>-<id>/`.
+Top-level files aggregate completed workspaces for the input roots:
+
+```text
+<launch directory, or -o directory>/
+├── top_domains.txt
+├── domains.txt
+├── domains_new.txt
+├── domains_resolved.txt
+├── scope_ips.txt
+├── domains_stage.txt
+├── dns_records.txt
+├── srv_records.txt
+├── dns_hosts_candidates.txt
+├── ptr_hosts_candidates.txt
+├── dns_zones_ns.txt
+├── axfr_result.txt
+├── puredns_subdomains.txt
+├── puredns_massdns.txt
+├── puredns_wildcards.txt
+├── subdomains/
+│   ├── subdomains_subfinder.txt
+│   ├── subdomains_puredns.txt
+│   └── ...
+├── bbot_active/<root>/
+├── bbot_passive/<root>/
+└── .osint/
+    ├── template-state.json
+    └── runs/
+```
+
+Only the per-source domain lists are in `subdomains/`. Full BBOT reports are
+copied to `bbot_active/<root>/` and `bbot_passive/<root>/`, keeping roots separate.
+Final lists and intermediate DNS/PureDNS files are directly in the result
+directory. An input already named `top_domains.txt` in that directory is kept
+verbatim. `domains_new.txt` contains names newly added to the final export by
+this invocation; passive-only runs do not invent a final collection stage.
+Export copies are deduplicated; per-command output files are untouched.
+
+The templates use `-n bbot_active` / `-n bbot_passive` and their matching copy
+paths. PureDNS retains its three top-level output files; a following explicit
+`cp` copies its discovered domains to `subdomains/subdomains_puredns.txt`
+before domain-list preparation. This includes PureDNS findings in the existing
+`subdomains/subdomains_*.txt` collection commands. The runner executes these
+updated template commands verbatim and never edits the templates at runtime.
+Local tests and default repository-root output files are ignored by Git.
 
 ## To Do
 
