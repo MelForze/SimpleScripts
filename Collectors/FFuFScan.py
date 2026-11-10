@@ -6,6 +6,7 @@ import csv
 import hashlib
 from html import escape as html_escape
 import io
+import ipaddress
 import json
 import os
 import re
@@ -477,8 +478,13 @@ class JobSpec:
 
 def build_specs_from_url_file(path: Path) -> list[JobSpec]:
     """Build ffuf jobs by grouping a URL input file by origin."""
+    return build_specs_from_urls(read_seed_urls(path))
+
+
+def build_specs_from_urls(urls: list[str]) -> list[JobSpec]:
+    """Group origins independently of source filenames and deduplicate their seeds."""
     grouped: dict[str, list[str]] = {}
-    for url in read_seed_urls(path):
+    for url in urls:
         grouped.setdefault(origin_from_url(url), []).append(url)
 
     return [
@@ -506,15 +512,40 @@ def read_paths_file(path: Path) -> list[str]:
 
 
 def build_specs_from_paths_dir(directory: Path) -> list[JobSpec]:
-    """Build ffuf jobs from a Katana paths directory."""
-    specs: list[JobSpec] = []
+    """Merge Katana seed files into one job per origin."""
+    urls: list[str] = []
     for path_file in sorted(directory.glob(f"*{KATANA_SUFFIX}")):
-        seed_urls = read_paths_file(path_file)
-        if not seed_urls:
-            continue
-        name = path_file.name[: -len(KATANA_SUFFIX)] if path_file.name.endswith(KATANA_SUFFIX) else path_file.stem
-        specs.append(JobSpec(name=name, seed_urls=seed_urls))
-    return specs
+        urls.extend(read_paths_file(path_file))
+    return build_specs_from_urls(urls)
+
+
+def host_key_from_url(url: str) -> str:
+    """Group literal IPs across ports/schemes; keep DNS names without resolving."""
+    hostname = (urlsplit(url).hostname or "").lower().rstrip(".")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return hostname
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return str(address.ipv4_mapped)
+    return address.compressed
+
+
+def rate_per_host(total_rate: int, parallel: int) -> int:
+    """Allocate a fixed ceil(total / configured slots), including idle slots."""
+    if total_rate < 1 or parallel < 1:
+        raise ValueError("rate and parallel slots must be positive")
+    return (total_rate + parallel - 1) // parallel
+
+
+def job_host_key(job: FfufJob) -> str:
+    return job.host_key or job.name
+
+
+def next_available_job_index(waiting: list[FfufJob], running: list[FfufJob]) -> int | None:
+    """Skip busy hosts so another port cannot occupy a second slot for one IP."""
+    busy = {job_host_key(job) for job in running}
+    return next((index for index, job in enumerate(waiting) if job_host_key(job) not in busy), None)
 
 
 def seed_slug(seed_url: str) -> str:
@@ -632,6 +663,8 @@ class FfufJob:
     command_text: str
     hashes: dict[str, str]
     stderr_log: Path
+    host_key: str = ""
+    origin: str = ""
     proc: subprocess.Popen | None = None
     started: float = 0.0
     done_est: int = 0
@@ -661,6 +694,7 @@ class FfufJob:
     stop_reason: str | None = None
     stop_requested_at: float = 0.0
     stop_aliases: set[str] = field(default_factory=set)
+    subscan_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -696,6 +730,7 @@ def build_stop_aliases(job_name: str, seed_urls: list[str]) -> set[str]:
             aliases.add(parsed.netloc.lower())
         if parsed.hostname:
             aliases.add(parsed.hostname.lower())
+        aliases.add(host_key_from_url(seed_url))
     return {alias for alias in aliases if alias}
 
 
@@ -757,7 +792,7 @@ def handle_interactive_command(
         return None, []
     lowered = command.lower()
     if lowered in {"help", "h", "?"}:
-        return None, ["Commands: s <id|host|job>, stop <id|host|job>, jobs, stops, help"]
+        return None, ["Commands: s <id|host|job>, stop <id|host|job>, jobs, stops, help; p pause new passes; l toggle log; arrows select host"]
     if lowered in {"jobs", "j"}:
         return None, describe_jobs(running=running, waiting=waiting)
     if lowered == "stops":
@@ -790,7 +825,7 @@ class InteractiveConsole:
         self.buffer = ""
         self._fd = sys.stdin.fileno() if self.enabled else -1
         self._old_attrs: list[object] | None = None
-        self._escape_sequence = False
+        self._escape_sequence = ""
 
     def start(self) -> None:
         if not self.enabled or termios is None or tty is None:
@@ -820,11 +855,14 @@ class InteractiveConsole:
         commands: list[str] = []
         for char in text:
             if self._escape_sequence:
+                self._escape_sequence += char
+                if self._escape_sequence in {"\x1b[A", "\x1b[B"}:
+                    commands.append("__up__" if char == "A" else "__down__")
                 if char.isalpha() or char == "~":
-                    self._escape_sequence = False
+                    self._escape_sequence = ""
                 continue
             if char == "\x1b":
-                self._escape_sequence = True
+                self._escape_sequence = "\x1b"
                 continue
             if char == "\x03":
                 raise KeyboardInterrupt
@@ -878,6 +916,7 @@ def stop_job(job: FfufJob, reason: str, terminate_timeout: float = 2.0) -> None:
         return
     now = time.time()
     job.stopped = True
+    job.subscan_pending = False
     job.failed = False
     job.finished = True
     job.stop_reason = reason
@@ -1085,8 +1124,13 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
     return True
 
 
-def reap_job(job: FfufJob) -> None:
+def reap_job(job: FfufJob, *, start_next: bool = True) -> None:
     """Update job completion state from the child process."""
+    if job.subscan_pending and not job.finished:
+        if start_next:
+            job.subscan_pending = False
+            start_active_ffuf_process(job, truncate_log=False)
+        return
     if job.finished or not job.proc:
         return
     retcode = job.proc.poll()
@@ -1098,7 +1142,10 @@ def reap_job(job: FfufJob) -> None:
             job.done_est = min(sum(job.subscan_totals[: completed_index + 1]), max(job.total, 1))
         job.active_subscan_index += 1
         job.proc = None
-        start_active_ffuf_process(job, truncate_log=False)
+        if start_next:
+            start_active_ffuf_process(job, truncate_log=False)
+        else:
+            job.subscan_pending = True
         return
 
     job.retcode = retcode
@@ -1752,6 +1799,7 @@ def prepare_job(
     recursion_depth = getattr(args, "recursion_depth", 0)
     headers = getattr(args, "headers", None) or []
     recursion_strategy = getattr(args, "recursion_strategy", "default")
+    per_host_rate = rate_per_host(args.rate, getattr(args, "parallel", 1))
     subscans: list[FfufSubscan] = []
 
     if recursion_depth > 0 and len(job_spec.seed_urls) > 1:
@@ -1771,7 +1819,7 @@ def prepare_job(
                 seeds_file=seeds_file,
                 wordlist=args.wordlist,
                 out_dir=subscan_out_dir,
-                rate=args.rate,
+                rate=per_host_rate,
                 headers=headers,
                 proxy=args.proxy,
                 extensions=extensions,
@@ -1801,7 +1849,7 @@ def prepare_job(
             seeds_file=seeds_file,
             wordlist=args.wordlist,
             out_dir=out_dir,
-            rate=args.rate,
+            rate=per_host_rate,
             headers=headers,
             proxy=args.proxy,
             extensions=extensions,
@@ -1828,11 +1876,13 @@ def prepare_job(
         seeds_file=seeds_file,
         out_dir=out_dir,
         total=total,
-        rate=args.rate,
+        rate=per_host_rate,
         cmd=cmd,
         command_text=command_text,
         hashes=hashes,
         stderr_log=out_dir / "ffuf.stderr.log",
+        host_key=host_key_from_url(job_spec.seed_urls[0]),
+        origin=origin_from_url(job_spec.seed_urls[0]),
         stop_aliases=build_stop_aliases(job_spec.name, job_spec.seed_urls),
         subscans=subscans,
         subscan_total_count=max(1, len(subscans)),
@@ -1901,14 +1951,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--parallel",
         type=int,
         default=2,
-        help="Maximum number of concurrent ffuf jobs. Default: 2",
+        help="Maximum active IPs/hosts; only one origin per host runs at a time. Default: 2",
     )
     parser.add_argument(
         "-r",
         "--rate",
         type=int,
         default=300,
-        help="ffuf -rate value for each job. Default: 300",
+        help="Shared rate budget. Each host gets ceil(rate / parallel), fixed even with idle slots. Default: 300",
     )
     parser.add_argument(
         "-e",
@@ -1976,6 +2026,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Print the exact ffuf command for each job before starting.",
     )
     parser.add_argument(
+        "--ui",
+        choices=("auto", "dashboard", "plain"),
+        default="auto",
+        help="Terminal display: dashboard on a TTY, plain logs otherwise. Default: auto",
+    )
+    parser.add_argument(
         "--keep-going",
         action="store_true",
         help="Continue processing other jobs even if one ffuf job fails.",
@@ -2006,7 +2062,7 @@ def render_status(
     header = (
         f"FFUF total={total_jobs} done={finished_count} failed={failed_count} "
         f"stopped={stopped_count} skipped={skipped_count} running={len(running)} waiting={waiting_count} "
-        f"parallel={parallel} rate={rate}"
+        f"parallel-hosts={parallel} total-rate={rate} per-host={rate_per_host(rate, parallel)}"
     )
     if interactive_enabled:
         header += " | controls: s <id|host>, jobs, stops, help"
@@ -2043,13 +2099,185 @@ def render_status(
     return len(lines)
 
 
+def build_dashboard(
+    jobs: list[FfufJob], running: list[FfufJob], waiting: list[FfufJob],
+    finished: list[FfufJob], skipped: int, selected_host: str, parallel: int,
+    total_rate: int, messages: list[str], prompt: str, paused: bool,
+    *, width: int = 120, height: int = 30, show_log: bool = False,
+):
+    """Build a terminal-size-aware dashboard from scheduler state only."""
+    from rich.layout import Layout
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    groups: dict[str, list[FfufJob]] = {}
+    for job in jobs:
+        groups.setdefault(job_host_key(job), []).append(job)
+    hosts = list(groups)
+    active = {job_host_key(job) for job in running}
+    share = rate_per_host(total_rate, parallel)
+    compact = width < 100
+    measured = sum(job.progress_rate for job in running)
+    errors = sum(job.ffuf_errors or 0 for job in jobs)
+    header = (
+        f"Hosts {len(active)}/{parallel} active | Origins {len(finished)}/{len(jobs)} done | Skipped {skipped}\n"
+        f"Total rate {total_rate} / {parallel} slots = {share}/IP | Rounded max {share * parallel}/s"
+    )
+    if not compact:
+        header += f" | Measured {measured:.1f}/s | Errors {errors}"
+    header_height = 5 if compact else 4
+    event_height = 5 if height < 28 else 7
+    footer_height = 4
+    body_height = max(4, height - header_height - event_height - footer_height)
+    visible = max(1, (body_height // 2 if compact else body_height) - 3)
+    selected_index = hosts.index(selected_host) if selected_host in hosts else 0
+    offset = max(0, min(selected_index - visible // 2, len(hosts) - visible))
+    table = Table(expand=True, box=None, padding=(0, 1))
+    for title in ("IP / Host", "State", "Origins", "Limit/s"):
+        table.add_column(title, no_wrap=True, overflow="ellipsis")
+    for host in hosts[offset: offset + visible]:
+        host_jobs = groups[host]
+        completed = sum(job.finished for job in host_jobs)
+        if host in active:
+            state = "paused" if any(job.subscan_pending for job in host_jobs) else "running"
+        elif any(not job.finished for job in host_jobs):
+            state = "waiting"
+        else:
+            state = "failed" if any(job.failed for job in host_jobs) else "stopped" if any(job.stopped for job in host_jobs) else "done"
+        table.add_row(
+            Text(("> " if host == selected_host else "  ") + host),
+            Text(state, style={"running": "green", "failed": "red", "paused": "yellow", "done": "cyan"}.get(state, "")),
+            Text(f"{completed}/{len(host_jobs)}"), Text(str(share)),
+            style="bold cyan" if host == selected_host else "",
+        )
+
+    host_jobs = groups.get(selected_host, [])
+    selected = next((job for job in running if job_host_key(job) == selected_host), None)
+    if selected is None:
+        selected = next((job for job in waiting if job_host_key(job) == selected_host), None)
+    if selected is None and host_jobs:
+        selected = host_jobs[-1]
+    detail_lines = ["Select an IP / host with the arrow keys."]
+    if selected is not None:
+        subscan = active_subscan(selected)
+        seed = subscan.seed_url if subscan is not None else str(selected.seeds_file)
+        detail_lines = [
+            f"Origin: {selected.origin or selected.name}",
+            f"Seed: {seed}",
+            f"Progress: {selected.done_est}/{selected.total} known requests",
+            f"Pass: {selected.active_subscan_index + 1}/{selected.subscan_total_count} | Limit: {selected.rate}/s",
+        ]
+        if not compact:
+            fraction = min(1.0, max(0.0, selected.done_est / max(1, selected.total)))
+            filled = int(fraction * 24)
+            detail_lines.insert(3, "━" * filled + "─" * (24 - filled) + f" {fraction:.0%} known")
+            if selected.finished:
+                state, heartbeat = ("failed" if selected.failed else "stopped" if selected.stopped else "done"), ""
+            elif selected in waiting:
+                state, heartbeat = "waiting", ""
+            else:
+                state, heartbeat = running_job_display_state(selected, time.time())
+            detail_lines += [
+                f"State: {'paused between passes' if selected.subscan_pending else state} {heartbeat}",
+                f"Measured: {selected.progress_rate:.1f}/s | Errors: {selected.ffuf_errors if selected.ffuf_errors is not None else '-'}",
+                f"Hits (completed origins): {sum(job.result_count or 0 for job in host_jobs if job.finished)}",
+                "Recursion may increase the known request total.",
+            ]
+
+    event_lines = messages[-max(1, event_height - 2):] or ["Waiting for events..."]
+    event_title = "Events"
+    if show_log and selected is not None:
+        event_title = f"ffuf stderr: {selected.name}"
+        try:
+            with selected.stderr_log.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - 8192))
+                log_lines = handle.read().decode("utf-8", errors="replace").replace("\r", "\n").splitlines()
+            event_lines = [line for line in log_lines if line.strip()][-max(1, event_height - 2):] or ["No log output yet."]
+        except OSError:
+            event_lines = ["Log will appear when this origin starts."]
+
+    root = Layout(name="root", size=max(12, height))
+    if height < 20:
+        root.split_column(
+            Layout(Panel(Text(f"Rate {total_rate}/{parallel} = {share}/IP | Origins {len(finished)}/{len(jobs)}"), title="FFuFScan"), size=3),
+            Layout(Panel(table, title="Hosts")),
+            Layout(Panel(Text(prompt or "Ctrl+C exits")), size=3),
+        )
+        return root
+    root.split_column(
+        Layout(Panel(Text(header), title="FFuFScan | QUEUE PAUSED" if paused else "FFuFScan"), size=header_height),
+        Layout(name="body"),
+        Layout(Panel(Text.from_ansi("\n".join(event_lines)), title=event_title), size=event_height),
+        Layout(name="footer", size=footer_height),
+    )
+    host_panel = Layout(Panel(table, title=Text(f"Hosts ({len(hosts)})")), name="hosts")
+    detail_panel = Layout(Panel(Text("\n".join(detail_lines)), title=Text(selected_host or "Details")), name="details")
+    if compact:
+        root["body"].split_column(host_panel, detail_panel)
+    else:
+        root["body"].split_row(host_panel, detail_panel)
+    controls = "↑↓ select | p↵ queue | l↵ logs | s↵ stop IP | Ctrl+C"
+    if not compact:
+        controls += " | s <id|host>↵ stop target"
+    root["footer"].update(Panel(Text(controls + ("\n" + prompt if prompt else "")), title="Controls"))
+    return root
+
+
+class FfufDashboard:
+    """Optional Rich full-screen view; redirected output remains plain text."""
+
+    def __init__(self, mode: str, jobs: list[FfufJob], parallel: int, rate: int) -> None:
+        self.jobs = jobs
+        self.parallel = parallel
+        self.rate = rate
+        self.hosts = list(dict.fromkeys(job_host_key(job) for job in jobs))
+        self.selected_host = self.hosts[0] if self.hosts else ""
+        self.show_log = False
+        self.enabled = mode != "plain" and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+        self.live = None
+        if mode == "dashboard" and not self.enabled:
+            raise ValueError("--ui dashboard requires a terminal; use --ui plain for redirected output")
+        if self.enabled:
+            try:
+                from rich.console import Console
+                from rich.live import Live
+            except ImportError:
+                if mode == "dashboard":
+                    raise ValueError("Rich is required for --ui dashboard; install the project dependencies") from None
+                self.enabled = False
+            else:
+                self.console = Console()
+                self.live = Live(console=self.console, screen=True, auto_refresh=False,
+                                 redirect_stdout=False, redirect_stderr=False)
+
+    def start(self) -> None:
+        if self.live is not None:
+            self.live.start()
+
+    def stop(self) -> None:
+        if self.live is not None:
+            self.live.stop()
+
+    def move_selection(self, direction: int) -> None:
+        if self.hosts:
+            index = self.hosts.index(self.selected_host)
+            self.selected_host = self.hosts[(index + direction) % len(self.hosts)]
+
+    def update(self, running, waiting, finished, skipped, messages, prompt, paused) -> None:
+        if self.live is not None:
+            size = self.console.size
+            self.live.update(build_dashboard(
+                self.jobs, running, waiting, finished, skipped, self.selected_host,
+                self.parallel, self.rate, messages, prompt, paused,
+                width=size.width, height=size.height, show_log=self.show_log,
+            ), refresh=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run parallel ffuf jobs from a URL file or Katana paths directory."""
     args = parse_args(argv)
-
-    if not args.dry_run and shutil.which("ffuf") is None:
-        print("Error: 'ffuf' was not found in PATH.", file=sys.stderr)
-        return 1
 
     if args.parallel < 1:
         print("Error: --parallel must be at least 1.", file=sys.stderr)
@@ -2065,10 +2293,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.recursion_depth > 0 and args.recursion_strategy == "default" and args.follow_redirects:
         print(
-            "Error: -fr/--follow-redirects cannot be used with --recursion-strategy default because "
-            "ffuf default recursion relies on redirects. Remove -fr or use -rs greedy.",
+            "Error: -fr with -rd > 0 conflicts with redirect-based recursion (-rs default). "
+            "To follow redirects, add -rs greedy; it recurses on every match and may add many requests. "
+            "Otherwise remove -fr. No jobs were started.",
             file=sys.stderr,
         )
+        return 1
+
+    if not args.dry_run and shutil.which("ffuf") is None:
+        print("Error: 'ffuf' was not found in PATH.", file=sys.stderr)
         return 1
 
     args.output_dir = Path(str(args.output_dir)).expanduser()
@@ -2121,7 +2354,10 @@ def main(argv: list[str] | None = None) -> int:
                 continue
         jobs.append(job)
         if args.dry_run:
-            print(f"# Job {job.job_id}: {job.name}; estimated base requests={job.total}")
+            print(
+                f"# Job {job.job_id}: {job.name}; host={job.host_key}; "
+                f"rate={job.rate}; estimated base requests={job.total}"
+            )
             print(f"# Planned seed file: {job.seeds_file}")
             for seed_url in spec.seed_urls:
                 print(f"#   {seed_url}")
@@ -2131,7 +2367,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print(
             f"# Dry run: jobs={len(specs)} run={len(jobs)} skipped={skipped_count}; "
-            f"parallel={args.parallel} rate={args.rate}/job"
+            f"host-slots={args.parallel} total-rate={args.rate} "
+            f"per-host={rate_per_host(args.rate, args.parallel)} "
+            f"rounded-max={rate_per_host(args.rate, args.parallel) * args.parallel}"
         )
         if args.recursion_depth:
             print("# Recursive discovery can add requests beyond the base estimate.")
@@ -2157,15 +2395,36 @@ def main(argv: list[str] | None = None) -> int:
     stop_requests: list[StopRequest] = []
     control_messages: list[str] = []
     console = InteractiveConsole()
+    try:
+        dashboard = FfufDashboard(args.ui, jobs, args.parallel, args.rate)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     console.start()
     interactive_enabled = console.enabled
     last_rendered = 0
     abort_requested = False
+    paused = False
+    last_plain_update = 0.0
+    last_plain_counts: tuple[int, ...] = ()
 
     try:
+        dashboard.start()
         try:
             while waiting or running:
                 for command in console.read_commands():
+                    if command in {"__up__", "__down__"}:
+                        dashboard.move_selection(-1 if command == "__up__" else 1)
+                        continue
+                    if command.lower() in {"p", "pause"}:
+                        paused = not paused
+                        control_messages.append("New passes paused; running ffuf processes continue" if paused else "Queue resumed")
+                        continue
+                    if command.lower() in {"l", "log"}:
+                        dashboard.show_log = not dashboard.show_log
+                        continue
+                    if command.lower() == "s" and dashboard.enabled:
+                        command = "s " + dashboard.selected_host
                     request, messages = handle_interactive_command(
                         command,
                         stop_requests=stop_requests,
@@ -2189,8 +2448,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
 
-                while waiting and len(running) < args.parallel:
-                    job = waiting.pop(0)
+                while waiting and len(running) < args.parallel and not paused:
+                    next_index = next_available_job_index(waiting, running)
+                    if next_index is None:
+                        break
+                    job = waiting.pop(next_index)
                     matched = next((request for request in stop_requests if job_matches_stop_request(job, request)), None)
                     if matched is not None:
                         matched_label = format_stop_request(matched)
@@ -2201,14 +2463,18 @@ def main(argv: list[str] | None = None) -> int:
                         continue
                     run_ffuf_background(job)
                     running.append(job)
+                    control_messages.append(f"{time.strftime('%H:%M:%S')} Start {job.origin} on {job.host_key}, rate={job.rate}")
 
                 for job in list(running):
                     update_job_progress_from_stderr(job)
-                    reap_job(job)
+                    reap_job(job, start_next=not paused)
                     if not job.finished:
                         continue
                     running.remove(job)
                     finished.append(job)
+                    control_messages.append(
+                        f"{time.strftime('%H:%M:%S')} {'Failed' if job.failed else 'Done'} {job.origin}; hits={job.result_count}"
+                    )
                     if job.failed:
                         failed_jobs.append(job)
                         if not args.keep_going:
@@ -2243,33 +2509,58 @@ def main(argv: list[str] | None = None) -> int:
                 if abort_requested:
                     break
 
-                clear_lines(last_rendered)
-                last_rendered = render_status(
-                    running=running,
-                    waiting_count=len(waiting),
-                    finished_count=len(finished),
-                    failed_count=len(failed_jobs),
-                    stopped_count=len(stopped_jobs),
-                    skipped_count=skipped_count,
-                    total_jobs=len(jobs) + skipped_count,
-                    parallel=args.parallel,
-                    rate=args.rate,
-                    control_messages=control_messages,
-                    interactive_enabled=interactive_enabled,
-                    console_prompt=console.prompt_line() if interactive_enabled else None,
-                )
+                if len(control_messages) > 200:
+                    del control_messages[:-200]
+                if dashboard.enabled:
+                    dashboard.update(running, waiting, finished, skipped_count, control_messages,
+                                     console.prompt_line() if interactive_enabled else "", paused)
+                else:
+                    counts = (len(running), len(waiting), len(finished), len(failed_jobs), len(stopped_jobs), int(paused))
+                    is_terminal = sys.stdout.isatty()
+                    if is_terminal or counts != last_plain_counts or time.monotonic() - last_plain_update >= 5:
+                        if is_terminal:
+                            clear_lines(last_rendered)
+                        last_rendered = render_status(
+                            running=running,
+                            waiting_count=len(waiting),
+                            finished_count=len(finished),
+                            failed_count=len(failed_jobs),
+                            stopped_count=len(stopped_jobs),
+                            skipped_count=skipped_count,
+                            total_jobs=len(jobs) + skipped_count,
+                            parallel=args.parallel,
+                            rate=args.rate,
+                            control_messages=control_messages,
+                            interactive_enabled=interactive_enabled,
+                            console_prompt=console.prompt_line() if interactive_enabled else None,
+                        )
+                        if not is_terminal:
+                            sys.stdout.write("\n")
+                            last_rendered = 0
+                        last_plain_counts = counts
+                        last_plain_update = time.monotonic()
                 time.sleep(0.2)
         except KeyboardInterrupt:
+            dashboard.stop()
+            print("Interrupted.", file=sys.stderr)
+            return 130
+    finally:
+        try:
             for job in running:
                 if job.proc and job.proc.poll() is None:
                     try:
                         job.proc.terminate()
+                        job.proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        job.proc.kill()
+                        job.proc.wait(timeout=2)
                     except OSError:
                         pass
-            print("Interrupted.", file=sys.stderr)
-            return 130
-    finally:
-        console.stop()
+        finally:
+            try:
+                dashboard.stop()
+            finally:
+                console.stop()
         if last_rendered:
             sys.stdout.write("\n")
             sys.stdout.flush()
@@ -2284,6 +2575,12 @@ def main(argv: list[str] | None = None) -> int:
 
     write_index_files(args.output_dir, summaries)
     write_unique_paths_html(args.output_dir, summaries)
+
+    print(
+        f"FFUF finished: done={sum(not job.failed and not job.stopped for job in finished)} "
+        f"failed={len(failed_jobs)} aborted={len(aborted_jobs)} stopped={len(stopped_jobs)} "
+        f"skipped={skipped_count}; reports: {args.output_dir}"
+    )
 
     if failed_jobs:
         print("\nFailed jobs:", file=sys.stderr)

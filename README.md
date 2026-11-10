@@ -52,6 +52,26 @@ device profile. Without a custom UA, `--browser` keeps using the headless engine
 In Katana v1.8.0, the built-in robots.txt/sitemap.xml fetchers set their own UA
 independently.
 
+FFuFScan merges input files by origin and schedules them by IP/host. Different
+ports or schemes on the same IP run sequentially; up to `-p` independent hosts
+can run in parallel. DNS names are grouped by hostname without DNS resolution.
+`-r` is now a shared budget: each host gets a fixed `ceil(r / p)` limit, even when
+some slots are idle. For example, `-p 5 -r 1000` gives 200/s per host; `-p 3 -r 1000`
+gives 334/s each (1002/s across three occupied slots due to rounding). This is
+ffuf's request-rate limit; following redirects can add HTTP exchanges.
+
+On a terminal, FFuFScan displays a dashboard with host queues, selected-origin
+details, progress and recent events. Use `--ui plain` for the previous text view
+or `--ui dashboard` to require the full-screen view. Arrow keys select a host;
+`p` + Enter pauses/resumes new jobs and recursive passes, `l` + Enter toggles its
+stderr log, and `s` + Enter stops the selected host and its queued origins.
+`s <id|host>` + Enter still targets a specific job or host. Already-running ffuf
+passes continue during a queue pause. Redirected output uses plain logs.
+
+`-fr` with `-rd > 0` and the default recursion strategy is rejected before any
+jobs start. Add `-rs greedy` explicitly to combine recursion with redirect
+following, or remove `-fr` to retain redirect-based directory recursion.
+
 ## To Do
 
 - [x] **Create Wildcard Hunter Script**  
