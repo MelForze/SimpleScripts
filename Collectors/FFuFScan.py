@@ -13,8 +13,10 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 try:
     import termios
     import tty
@@ -22,7 +24,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
     termios = None
     tty = None
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -32,6 +34,10 @@ PROGRESS_RE = re.compile(r"Progress:\s*\[(\d+)/(\d+)\]")
 FFUF_JOB_RE = re.compile(r"Job\s*\[(\d+)/(\d+)\]")
 SUBSCAN_RE = re.compile(r"FFUFScan subscan:\s*\[(\d+)/(\d+)\]\s+total=(\d+)")
 ERRORS_RE = re.compile(r"Errors:\s*(\d+)")
+RATE_RE = re.compile(r"(\d+) req/sec")
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+QUEUED_TARGET_RE = re.compile(r"Starting queued job on target:\s*(\S+)")
+LIVE_MATCH_LIMIT = 100
 PRIMARY_RESULT_EXTENSIONS = (".json", ".html", ".md", ".csv")
 EXTRA_RESULT_EXTENSIONS = (".ejson", ".ecsv")
 
@@ -156,6 +162,8 @@ def read_result_count(result_json: Path) -> int | None:
         data = json.loads(result_json.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(data, dict):
+        return None
     results = data.get("results")
     if isinstance(results, list):
         return len(results)
@@ -229,7 +237,7 @@ def parse_ffuf_stderr_diagnostics(text: str) -> dict[str, int | None]:
     ffuf_job_total: int | None = None
     subscan_index = 0
     subscan_totals: list[int] = []
-    normalized = text.replace("\r", "\n")
+    normalized = ANSI_RE.sub("", text).replace("\r", "\n").replace(":: Progress:", "\n:: Progress:")
     for line in normalized.splitlines():
         subscan_match = SUBSCAN_RE.search(line)
         if subscan_match:
@@ -319,10 +327,21 @@ def load_resume_state(out_dir: Path, hashes: dict[str, str]) -> dict[str, object
     except (OSError, json.JSONDecodeError):
         return None
 
-    if state.get("status") != "done":
+    if not isinstance(state, dict) or state.get("status") != "done":
         return None
     if state.get("hashes") != hashes:
         return None
+    if checked_reports(out_dir) is None:
+        return None
+    if state.get("checkpoint_version") == 1:
+        records = state.get("passes")
+        if not isinstance(records, list) or not records or not all(
+            isinstance(record, dict) and record.get("status") == "done" and checkpoint_reports_valid(out_dir, record)
+            for record in records
+        ):
+            return None
+        if state.get("report_hashes") != checked_reports(out_dir):
+            return None
 
     resumed_state = dict(state)
     resumed_state["status"] = "skipped"
@@ -330,13 +349,14 @@ def load_resume_state(out_dir: Path, hashes: dict[str, str]) -> dict[str, object
     result_count = read_result_count(out_dir / "result.json")
     if result_count is not None:
         resumed_state["result_count"] = result_count
-    stderr_diagnostics = read_ffuf_stderr_diagnostics(out_dir / "ffuf.stderr.log")
-    if stderr_diagnostics["progress_done"] is not None:
-        resumed_state["ffuf_progress_done"] = stderr_diagnostics["progress_done"]
-    if stderr_diagnostics["progress_total"] is not None:
-        resumed_state["ffuf_progress_total"] = stderr_diagnostics["progress_total"]
-    if stderr_diagnostics["errors"] is not None:
-        resumed_state["ffuf_errors"] = stderr_diagnostics["errors"]
+    if state.get("checkpoint_version") != 1:
+        stderr_diagnostics = read_ffuf_stderr_diagnostics(out_dir / "ffuf.stderr.log")
+        if stderr_diagnostics["progress_done"] is not None:
+            resumed_state["ffuf_progress_done"] = stderr_diagnostics["progress_done"]
+        if stderr_diagnostics["progress_total"] is not None:
+            resumed_state["ffuf_progress_total"] = stderr_diagnostics["progress_total"]
+        if stderr_diagnostics["errors"] is not None:
+            resumed_state["ffuf_errors"] = stderr_diagnostics["errors"]
     paths_file = out_dir / "paths.txt"
     if paths_file.exists():
         resumed_state["seed_count"] = count_nonempty_lines(paths_file)
@@ -577,7 +597,7 @@ def build_ffuf_cmd(
     """Build an ffuf command for one job."""
     cmd = [
         "ffuf",
-        "-c",
+        "-json",
         "-noninteractive",
     ]
     if base_url:
@@ -652,6 +672,32 @@ class FfufSubscan:
 
 
 @dataclass
+class FfufPass:
+    index: int
+    seed_url: str
+    out_dir: Path
+    cmd: list[str]
+    total: int
+    status: str = "queued"
+    started: float = 0.0
+    duration: float = 0.0
+    result_count: int = 0
+    done: int = 0
+    errors: int | None = None
+    exit_code: int | None = None
+    task_done: int | None = None
+    task_total: int | None = None
+    task_current: int | None = None
+    task_count: int | None = None
+    task_template: str = ""
+    task_duration: float = 0.0
+    stderr_start: int = 0
+    matches_start: int = 0
+    reports: dict[str, str] = field(default_factory=dict)
+    recent_matches: list[dict[str, object]] = field(default_factory=list)
+
+
+@dataclass
 class FfufJob:
     job_id: int
     name: str
@@ -695,6 +741,24 @@ class FfufJob:
     stop_requested_at: float = 0.0
     stop_aliases: set[str] = field(default_factory=set)
     subscan_pending: bool = False
+    seed_urls: list[str] = field(default_factory=list)
+    pass_started: float = 0.0
+    task_started: float = 0.0
+    task_template: str = ""
+    task_done: int | None = None
+    task_total: int | None = None
+    seed_done: int = 0
+    seed_total: int = 0
+    matches_offset: int = 0
+    matches_remainder: bytes = b""
+    live_hits: int = 0
+    recent_matches: list[dict[str, object]] = field(default_factory=list)
+    passes: list[FfufPass] = field(default_factory=list)
+    checkpoint_enabled: bool = False
+    partial_resumed: bool = False
+    previous_duration: float = 0.0
+    failure_reason: str | None = None
+    pass_interrupted: bool = False
 
 
 @dataclass(frozen=True)
@@ -792,7 +856,7 @@ def handle_interactive_command(
         return None, []
     lowered = command.lower()
     if lowered in {"help", "h", "?"}:
-        return None, ["Commands: s <id|host|job>, stop <id|host|job>, jobs, stops, help; p pause new passes; l toggle log; arrows select host"]
+        return None, ["Commands: s <id|host|job>, stop <id|host|job>, jobs, stops, help; p pause new passes; l toggle log; arrows move; Tab hosts/origins; Enter expand; Esc back; PgUp/PgDn scroll details"]
     if lowered in {"jobs", "j"}:
         return None, describe_jobs(running=running, waiting=waiting)
     if lowered == "stops":
@@ -826,6 +890,8 @@ class InteractiveConsole:
         self._fd = sys.stdin.fileno() if self.enabled else -1
         self._old_attrs: list[object] | None = None
         self._escape_sequence = ""
+        self._escape_started = 0.0
+        self._last_cr = False
 
     def start(self) -> None:
         if not self.enabled or termios is None or tty is None:
@@ -854,23 +920,36 @@ class InteractiveConsole:
         """Feed terminal text into the console and return completed commands."""
         commands: list[str] = []
         for char in text:
-            if self._escape_sequence:
-                self._escape_sequence += char
-                if self._escape_sequence in {"\x1b[A", "\x1b[B"}:
-                    commands.append("__up__" if char == "A" else "__down__")
-                if char.isalpha() or char == "~":
-                    self._escape_sequence = ""
+            if char == "\n" and self._last_cr:
+                self._last_cr = False
                 continue
+            self._last_cr = char == "\r"
+            if self._escape_sequence:
+                if self._escape_sequence == "\x1b" and char != "[":
+                    commands.append("__escape__")
+                    self._escape_sequence = ""
+                else:
+                    self._escape_sequence += char
+                    keys = {"\x1b[A": "__up__", "\x1b[B": "__down__",
+                            "\x1b[5~": "__page_up__", "\x1b[6~": "__page_down__"}
+                    if self._escape_sequence in keys:
+                        commands.append(keys[self._escape_sequence])
+                    if char.isalpha() or char == "~":
+                        self._escape_sequence = ""
+                    continue
             if char == "\x1b":
                 self._escape_sequence = "\x1b"
+                self._escape_started = time.monotonic()
                 continue
             if char == "\x03":
                 raise KeyboardInterrupt
             if char in {"\r", "\n"}:
                 command = self.buffer.strip()
                 self.buffer = ""
-                if command:
-                    commands.append(command)
+                commands.append(command if command else "__enter__")
+                continue
+            if char == "\t":
+                commands.append("__tab__")
                 continue
             if char in {"\x7f", "\b"}:
                 self.buffer = self.buffer[:-1]
@@ -897,6 +976,12 @@ class InteractiveConsole:
                     break
                 commands.extend(self.feed_text(chunk.decode("utf-8", errors="ignore")))
                 ready, _, _ = select.select([sys.stdin], [], [], 0)
+            # Allow split arrow-key sequences, but also recognize a standalone Esc.
+            if self._escape_sequence and time.monotonic() - self._escape_started >= 0.1:
+                if self._escape_sequence == "\x1b":
+                    commands.append("__escape__")
+                    self.buffer = ""
+                self._escape_sequence = ""
         except (OSError, ValueError):
             return commands
         return commands
@@ -922,7 +1007,7 @@ def stop_job(job: FfufJob, reason: str, terminate_timeout: float = 2.0) -> None:
     job.stop_reason = reason
     job.stop_requested_at = now
     if job.started > 0:
-        job.duration_seconds = max(0.0, now - job.started)
+        job.duration_seconds = job.previous_duration + max(0.0, now - job.started)
 
     if job.proc and job.proc.poll() is None:
         try:
@@ -943,8 +1028,18 @@ def stop_job(job: FfufJob, reason: str, terminate_timeout: float = 2.0) -> None:
 
     if job.proc:
         job.retcode = job.proc.returncode
+    if job.started:
+        update_job_progress_from_stderr(job)
+        update_job_matches(job, drain=True)
+    job.checkpoint_enabled = bool(job.passes)
+    finish_pass(job, "stopped")
+    for item in job.passes:
+        if item.status == "queued":
+            item.status = "stopped"
     aggregate_recursive_subscan_outputs(job)
-    job.result_count = read_result_count(job.out_dir / "result.json")
+    job.result_count = read_result_count(job.out_dir / "result.json") if job.started or any(item.status == "done" for item in job.passes) else 0
+    if job.checkpoint_enabled:
+        write_job_state(job, job.out_dir.parent, status="stopped")
 
 
 def apply_stop_requests(
@@ -1011,26 +1106,294 @@ def start_active_ffuf_process(job: FfufJob, truncate_log: bool) -> None:
     job.ffuf_job_total = None
     job.ffuf_progress_done = None
     job.ffuf_progress_total = None
+    job.ffuf_errors = None
+    job.pass_interrupted = False
     now = time.time()
+    job.pass_started = now
+    job.task_started = now
+    job.task_template = command_option(cmd, "-u") or "URLFUZZ"
+    job.task_done = None
+    job.task_total = None
+    job.seed_done = 0
+    job.seed_total = current_subscan.estimated_total if current_subscan else job.total
+    job.progress_rate = 0.0
+    job.last_progress_time = 0.0
+    job.last_display_progress_value = job.done_est
     job.last_stderr_activity = now
+    if truncate_log:
+        job.progress_offset = 0
+        job.progress_remainder = ""
+        job.matches_offset = 0
+        job.matches_remainder = b""
+        if not job.partial_resumed:
+            job.live_hits = 0
+            job.recent_matches.clear()
+    item = active_pass(job)
+    if job.checkpoint_enabled and item:
+        item.status = "running"
+        item.started = now
+        item.result_count = 0
+        item.recent_matches.clear()
+        item.stderr_start = 0 if truncate_log or not job.stderr_log.exists() else job.stderr_log.stat().st_size
+        matches_log = job.out_dir / "ffuf.matches.jsonl"
+        item.matches_start = 0 if truncate_log or not matches_log.exists() else matches_log.stat().st_size
+        # A failed/interrupted attempt's files must not become a successful pass.
+        for extension in PRIMARY_RESULT_EXTENSIONS + EXTRA_RESULT_EXTENSIONS:
+            (item.out_dir / f"result{extension}").unlink(missing_ok=True)
+        write_job_state(job, job.out_dir.parent, status="running")
     stderr_handle = job.stderr_log.open("w" if truncate_log else "a", encoding="utf-8")
     if current_subscan is not None:
         write_subscan_marker(stderr_handle, current_subscan)
-    job.proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_handle,
-        text=True,
-    )
-    stderr_handle.close()
+    try:
+        # A regular file cannot fill a pipe and block ffuf while the UI renders.
+        with (job.out_dir / "ffuf.matches.jsonl").open("wb" if truncate_log else "ab") as matches_handle:
+            job.proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=matches_handle,
+                stderr=stderr_handle, text=True,
+            )
+    finally:
+        stderr_handle.close()
 
 
 def run_ffuf_background(job: FfufJob) -> None:
     """Start ffuf for one job in the background."""
     job.started = time.time()
-    job.active_subscan_index = 0
+    job.checkpoint_enabled = bool(job.passes)
+    index = next_pending_pass(job) if job.passes else 0
+    if index is None:
+        aggregate_recursive_subscan_outputs(job)
+        job.finished = True
+        job.retcode = 0
+        job.duration_seconds = job.previous_duration
+        job.result_count = read_result_count(job.out_dir / "result.json")
+        write_job_state(job, job.out_dir.parent)
+        return
+    job.active_subscan_index = index
     start_active_ffuf_process(job, truncate_log=True)
+
+
+def command_option(command: list[str], flag: str) -> str | None:
+    """Read a value from an already-built command without executing it."""
+    try:
+        return command[command.index(flag) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Replace a state file only after its complete contents reach disk."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def checked_reports(directory: Path) -> dict[str, str] | None:
+    """An empty results list is valid; missing or malformed reports are not."""
+    try:
+        paths = [directory / f"result{extension}" for extension in PRIMARY_RESULT_EXTENSIONS]
+        if not all(path.is_file() for path in paths):
+            return None
+        data = json.loads(paths[0].read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+            return None
+        if not all(isinstance(item, dict) for item in data["results"]):
+            return None
+        return {path.suffix: sha256_file(path) for path in paths}
+    except (OSError, ValueError):
+        return None
+
+
+def pass_record(item: FfufPass, root: Path) -> dict[str, object]:
+    return {
+        "index": item.index, "seed_url": item.seed_url,
+        "directory": relpath_or_absolute(root, item.out_dir),
+        "command_sha256": sha256_text(shlex.join(item.cmd)),
+        "status": item.status, "started": item.started, "duration": item.duration,
+        "result_count": item.result_count, "done": item.done, "total": item.total,
+        "errors": item.errors, "exit_code": item.exit_code,
+        "task_done": item.task_done, "task_total": item.task_total,
+        "task_current": item.task_current, "task_count": item.task_count,
+        "task_template": item.task_template, "reports": item.reports,
+        "task_duration": item.task_duration,
+    }
+
+
+def compact_match(item: dict[str, object]) -> dict[str, object]:
+    return {key: item.get(key) for key in ("url", "status", "length", "words", "redirectlocation")}
+
+
+def checkpoint_reports_valid(root: Path, record: dict[str, object]) -> bool:
+    directory = record.get("directory")
+    if not isinstance(directory, str):
+        return False
+    path = Path(directory)
+    if path.is_absolute() or ".." in path.parts:
+        return False
+    expected = record.get("reports")
+    return isinstance(expected, dict) and bool(expected) and checked_reports(root / path) == expected
+
+
+def load_partial_resume(job: FfufJob) -> int:
+    """Restore independently verified passes, leaving all other passes queued."""
+    try:
+        state = json.loads((job.out_dir / "job.json").read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or state.get("checkpoint_version") != 1 or state.get("hashes") != job.hashes:
+            return 0
+        records = state.get("passes")
+        if not isinstance(records, list) or len(records) != len(job.passes):
+            return 0
+        restored = 0
+        for item, record in zip(job.passes, records):
+            if not isinstance(record, dict) or record.get("index") != item.index or record.get("seed_url") != item.seed_url:
+                continue
+            if record.get("command_sha256") != sha256_text(shlex.join(item.cmd)):
+                continue
+            if record.get("status") != "done" or not checkpoint_reports_valid(job.out_dir, record):
+                continue
+            # Optional display fields must never prevent a safe restart.
+            item.status = "done"
+            item.reports = dict(record["reports"])
+            for attr in ("started", "duration", "done", "total", "errors", "task_done", "task_total", "task_current", "task_count", "task_duration"):
+                value = record.get(attr)
+                expected_type = (int, float) if attr in {"started", "duration", "task_duration"} else (int,)
+                if type(value) in expected_type and 0 <= value < 10**15:
+                    setattr(item, attr, value)
+            item.exit_code = 0
+            item.task_template = str(record.get("task_template") or command_option(item.cmd, "-u") or "URLFUZZ")
+            results = read_ffuf_result_items(item.out_dir / "result.json")
+            item.result_count = len(results)
+            item.recent_matches = [compact_match(row) for row in results[-LIVE_MATCH_LIMIT:]]
+            if job.subscan_totals:
+                job.subscan_totals[item.index - 1] = max(item.total, item.done)
+            restored += 1
+        if restored:
+            job.checkpoint_enabled = True
+            job.partial_resumed = True
+            job.previous_duration = sum(item.duration for item in job.passes if item.status == "done")
+            job.done_est = sum(item.total for item in job.passes if item.status == "done")
+            job.total = sum(item.total for item in job.passes)
+            job.live_hits = sum(item.result_count for item in job.passes if item.status == "done")
+            job.recent_matches = [row for item in job.passes if item.status == "done" for row in item.recent_matches][-LIVE_MATCH_LIMIT:]
+        return restored
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def active_pass(job: FfufJob) -> FfufPass | None:
+    return job.passes[job.active_subscan_index] if job.passes else None
+
+
+def next_pending_pass(job: FfufJob) -> int | None:
+    return next((index for index, item in enumerate(job.passes) if item.status != "done"), None)
+
+
+def copy_log_segment(source: Path, target: Path, start: int) -> None:
+    if source == target or not source.exists():
+        return
+    with source.open("rb") as reader, target.open("wb") as writer:
+        reader.seek(start)
+        shutil.copyfileobj(reader, writer, length=64 * 1024)
+
+
+def finish_pass(job: FfufJob, status: str) -> None:
+    """Capture a process's history before another seed can overwrite counters."""
+    item = active_pass(job)
+    if item is None or not job.checkpoint_enabled or item.status != "running":
+        return
+    item.status = status
+    item.duration = max(0.0, time.time() - item.started)
+    item.done, item.total = job.seed_done, job.seed_total
+    item.errors, item.exit_code = job.ffuf_errors, job.proc.returncode if job.proc else None
+    item.task_done, item.task_total = job.task_done, job.task_total
+    item.task_current, item.task_count = job.ffuf_job_current, job.ffuf_job_total
+    item.task_template = job.task_template
+    item.task_duration = max(0.0, time.time() - job.task_started) if job.task_started else 0.0
+    item.recent_matches = list(item.recent_matches)
+    if status == "done":
+        item.reports = checked_reports(item.out_dir) or {}
+        if not item.reports:
+            item.status = "failed"
+            job.failure_reason = f"Seed pass {item.index}: ffuf exited without valid result.json/html/md/csv"
+        else:
+            item.result_count = read_result_count(item.out_dir / "result.json") or 0
+            if not item.recent_matches:
+                item.recent_matches = [compact_match(row) for row in read_ffuf_result_items(item.out_dir / "result.json")[-LIVE_MATCH_LIMIT:]]
+            item.total = max(item.total, item.done)
+            item.done = item.total
+    copy_log_segment(job.stderr_log, item.out_dir / "ffuf.stderr.log", item.stderr_start)
+    copy_log_segment(job.out_dir / "ffuf.matches.jsonl", item.out_dir / "ffuf.matches.jsonl", item.matches_start)
+    job.duration_seconds = job.previous_duration + max(0.0, time.time() - job.started)
+    # The checkpoint contains the pass before aggregation or another subprocess starts.
+    write_job_state(job, job.out_dir.parent, status="running")
+
+
+def inspection_job(job: FfufJob, index: int | None) -> FfufJob:
+    """A detached display snapshot prevents inspecting history from changing work."""
+    if index is None or index < 0 or index >= len(job.passes):
+        return job
+    item = job.passes[index]
+    current = item.status == "running"
+    return replace(
+        job, active_subscan_index=index, cmd=item.cmd, started=item.started,
+        pass_started=item.started, task_started=job.task_started if current else item.started + item.duration - item.task_duration if item.task_duration else 0.0,
+        finished=item.status not in {"queued", "running"}, failed=item.status == "failed",
+        stopped=item.status in {"stopped", "interrupted"}, duration_seconds=item.duration,
+        seed_done=job.seed_done if current else item.done, seed_total=job.seed_total if current else item.total,
+        task_done=job.task_done if current else item.task_done, task_total=job.task_total if current else item.task_total,
+        task_template=job.task_template if current else item.task_template,
+        ffuf_job_current=job.ffuf_job_current if current else item.task_current,
+        ffuf_job_total=job.ffuf_job_total if current else item.task_count,
+        ffuf_errors=job.ffuf_errors if current else item.errors,
+        result_count=item.result_count, live_hits=item.result_count, recent_matches=item.recent_matches,
+        stderr_log=job.stderr_log if current else item.out_dir / "ffuf.stderr.log",
+        previous_duration=0.0,
+        last_progress_time=job.last_progress_time if current else item.started + item.duration if item.done else 0.0,
+    )
+
+def update_job_matches(job: FfufJob, *, drain: bool = False) -> None:
+    """Tail JSONL matches with bounded UI memory and bounded work per refresh."""
+    try:
+        with (job.out_dir / "ffuf.matches.jsonl").open("rb") as handle:
+            handle.seek(job.matches_offset)
+            while True:
+                chunk = handle.read(256 * 1024)
+                if not chunk:
+                    break
+                job.matches_offset += len(chunk)
+                lines = (job.matches_remainder + chunk).split(b"\n")
+                job.matches_remainder = lines.pop()
+                for line in lines:
+                    try:
+                        item = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        continue
+                    if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+                        continue
+                    job.live_hits += 1
+                    job.recent_matches.append(compact_match(item))
+                    del job.recent_matches[:-LIVE_MATCH_LIMIT]
+                    item_pass = active_pass(job)
+                    if job.checkpoint_enabled and item_pass and item_pass.status == "running":
+                        item_pass.result_count += 1
+                        item_pass.recent_matches.append(job.recent_matches[-1])
+                        del item_pass.recent_matches[:-LIVE_MATCH_LIMIT]
+                # Malformed/non-JSON output must not grow the pending buffer forever.
+                if len(job.matches_remainder) > 1024 * 1024:
+                    job.matches_remainder = b""
+                if not drain:
+                    break
+    except OSError:
+        return
 
 
 def update_job_progress_from_stderr(job: FfufJob) -> bool:
@@ -1051,15 +1414,29 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
     job.last_stderr_activity = time.time()
     job.progress_offset += len(chunk)
     text = chunk.decode("utf-8", errors="ignore").replace("\r", "\n")
-    combined = job.progress_remainder + text
+    combined = (job.progress_remainder + text).replace(":: Progress:", "\n:: Progress:")
     lines = combined.split("\n")
 
     if combined and not combined.endswith("\n"):
         job.progress_remainder = lines.pop()
+        # ffuf writes progress with carriage returns and no final newline.
+        tail = ANSI_RE.sub("", job.progress_remainder).strip()
+        if PROGRESS_RE.search(tail) and ERRORS_RE.search(tail) and tail.endswith("::"):
+            lines.append(job.progress_remainder)
+            job.progress_remainder = ""
     else:
         job.progress_remainder = ""
 
     for line in lines:
+        line = ANSI_RE.sub("", line)
+        if "Caught keyboard interrupt" in line:
+            job.pass_interrupted = True
+        target_match = QUEUED_TARGET_RE.search(line)
+        if target_match:
+            job.task_template = target_match.group(1)
+            job.task_started = time.time()
+            job.task_done = None
+            job.task_total = None
         subscan_match = SUBSCAN_RE.search(line)
         if subscan_match:
             subscan_current = int(subscan_match.group(1))
@@ -1078,6 +1455,9 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
 
         job_match = FFUF_JOB_RE.search(line)
         if job_match:
+            if job.ffuf_job_current is not None and job.ffuf_job_current != int(job_match.group(1)):
+                job.task_started = time.time()
+                job.last_progress_time = 0.0
             job.ffuf_job_current = int(job_match.group(1))
             job.ffuf_job_total = int(job_match.group(2))
 
@@ -1086,6 +1466,8 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
             now = time.time()
             current = int(match.group(1))
             total = int(match.group(2))
+            job.task_done = current
+            job.task_total = total
             job.ffuf_progress_done = current
             job.ffuf_progress_total = total
             if total > 0:
@@ -1095,6 +1477,7 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
                     job.ffuf_job_current,
                     job.ffuf_job_total,
                 )
+                job.seed_done, job.seed_total = display_current, display_total
                 if job.subscan_totals:
                     display_current, display_total = subscan_aggregate_progress(
                         job.subscan_totals,
@@ -1102,6 +1485,9 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
                         display_current,
                         display_total,
                     )
+                if job.checkpoint_enabled:
+                    display_current = sum(item.total for item in job.passes if item.status == "done") + job.seed_done
+                    display_total = sum(item.total if item.status == "done" else max(item.total, job.seed_total) if item is active_pass(job) else item.total for item in job.passes)
                 job.ffuf_progress_done = display_current
                 job.ffuf_progress_total = display_total
                 job.total = display_total
@@ -1116,6 +1502,9 @@ def update_job_progress_from_stderr(job: FfufJob) -> bool:
                 job.last_display_progress_value = progress_value
                 job.last_progress_value = current
                 job.last_progress_time = now
+            rate_match = RATE_RE.search(line)
+            if rate_match:
+                job.progress_rate = float(rate_match.group(1))
 
         errors_match = ERRORS_RE.search(line)
         if errors_match:
@@ -1136,27 +1525,54 @@ def reap_job(job: FfufJob, *, start_next: bool = True) -> None:
     retcode = job.proc.poll()
     if retcode is None:
         return
-    if retcode == 0 and job.subscans and job.active_subscan_index + 1 < len(job.subscans):
-        if job.subscan_totals:
+    # Capture the final records/counters before switching to another seed.
+    update_job_progress_from_stderr(job)
+    update_job_matches(job, drain=True)
+    incomplete = job.pass_interrupted or (
+        job.task_total is not None and (job.task_done or 0) < job.task_total
+    ) or (job.ffuf_job_current is not None and job.ffuf_job_total is not None and job.ffuf_job_current < job.ffuf_job_total)
+    if retcode == 0 and incomplete and job.checkpoint_enabled:
+        job.failure_reason = "ffuf stopped before completing this seed pass; its partial report is not a completed checkpoint"
+        finish_pass(job, "interrupted")
+        retcode = 1
+    else:
+        finish_pass(job, "done" if retcode == 0 else "failed")
+    if job.checkpoint_enabled and active_pass(job) and active_pass(job).status == "failed":
+        retcode = retcode or 1
+    next_index = next_pending_pass(job) if job.checkpoint_enabled else job.active_subscan_index + 1
+    has_next = next_index is not None and (job.checkpoint_enabled or next_index < len(job.subscans))
+    if retcode == 0 and job.subscans and has_next:
+        if job.checkpoint_enabled:
+            job.done_est = sum(item.total for item in job.passes if item.status == "done")
+        elif job.subscan_totals:
             completed_index = max(0, min(job.active_subscan_index, len(job.subscan_totals) - 1))
             job.done_est = min(sum(job.subscan_totals[: completed_index + 1]), max(job.total, 1))
-        job.active_subscan_index += 1
+        job.active_subscan_index = next_index
         job.proc = None
         if start_next:
             start_active_ffuf_process(job, truncate_log=False)
         else:
             job.subscan_pending = True
+            job.task_template = ""
+            job.task_done = job.task_total = None
+            job.seed_done = 0
+            job.seed_total = job.subscans[job.active_subscan_index].estimated_total
+            job.pass_started = job.task_started = 0.0
+            job.progress_rate = 0.0
+            job.last_progress_time = 0.0
         return
 
     job.retcode = retcode
     job.finished = True
     job.failed = retcode != 0
-    job.duration_seconds = max(0.0, time.time() - job.started)
+    job.duration_seconds = job.previous_duration + max(0.0, time.time() - job.started)
     if job.subscans:
         aggregate_recursive_subscan_outputs(job)
     job.result_count = read_result_count(job.out_dir / "result.json")
     if not job.failed:
         job.done_est = job.total
+    if job.checkpoint_enabled:
+        write_job_state(job, job.out_dir.parent)
 
 
 def cleanup_ffuf_outputs(out_dir: Path) -> None:
@@ -1172,6 +1588,8 @@ def cleanup_ffuf_outputs(out_dir: Path) -> None:
 
 def job_seed_count(job: FfufJob) -> int | None:
     """Return the number of seed URLs for a job when paths.txt is readable."""
+    if job.seed_urls:
+        return len(job.seed_urls)
     try:
         return count_nonempty_lines(job.seeds_file)
     except OSError:
@@ -1181,16 +1599,22 @@ def job_seed_count(job: FfufJob) -> int | None:
 def build_job_summary(job: FfufJob, output_root: Path, status: str | None = None, resumed: bool = False) -> dict[str, object]:
     """Build a serializable per-job summary."""
     actual_status = status or ("stopped" if job.stopped else "failed" if job.failed else "done")
-    stderr_diagnostics = read_ffuf_stderr_diagnostics(job.stderr_log)
-    progress_done = stderr_diagnostics["progress_done"]
-    progress_total = stderr_diagnostics["progress_total"]
-    errors = stderr_diagnostics["errors"]
-    if progress_done is None:
-        progress_done = job.ffuf_progress_done
-    if progress_total is None:
-        progress_total = job.ffuf_progress_total
-    if errors is None:
-        errors = job.ffuf_errors
+    if job.checkpoint_enabled:
+        progress_done, progress_total = job.done_est, job.total
+        errors = sum(item.errors or 0 for item in job.passes if item.status != "running")
+        if active_pass(job) and active_pass(job).status == "running":
+            errors += job.ffuf_errors or 0
+    else:
+        stderr_diagnostics = read_ffuf_stderr_diagnostics(job.stderr_log)
+        progress_done = stderr_diagnostics["progress_done"]
+        progress_total = stderr_diagnostics["progress_total"]
+        errors = stderr_diagnostics["errors"]
+        if progress_done is None:
+            progress_done = job.ffuf_progress_done
+        if progress_total is None:
+            progress_total = job.ffuf_progress_total
+        if errors is None:
+            errors = job.ffuf_errors
     outputs = {
         "json": relpath_or_absolute(output_root, job.out_dir / "result.json"),
         "html": relpath_or_absolute(output_root, job.out_dir / "result.html"),
@@ -1199,7 +1623,7 @@ def build_job_summary(job: FfufJob, output_root: Path, status: str | None = None
         "stderr_log": relpath_or_absolute(output_root, job.stderr_log),
         "command": relpath_or_absolute(output_root, job.out_dir / "command.txt"),
     }
-    return {
+    summary = {
         "job_id": job.job_id,
         "name": job.name,
         "status": actual_status,
@@ -1217,7 +1641,13 @@ def build_job_summary(job: FfufJob, output_root: Path, status: str | None = None
         "command": job.command_text,
         "stop_reason": job.stop_reason,
         "stop_requested_at": None if job.stop_requested_at <= 0 else round(job.stop_requested_at, 3),
+        "failure_reason": job.failure_reason,
     }
+    if job.checkpoint_enabled:
+        summary.update(checkpoint_version=1, passes=[pass_record(item, job.out_dir) for item in job.passes],
+                       report_hashes=checked_reports(job.out_dir) if actual_status == "done" else None,
+                       has_current_results=bool(job.started or any(item.status == "done" for item in job.passes)))
+    return summary
 
 
 def write_job_state(job: FfufJob, output_root: Path, status: str | None = None, resumed: bool = False) -> dict[str, object]:
@@ -1225,14 +1655,16 @@ def write_job_state(job: FfufJob, output_root: Path, status: str | None = None, 
     summary = build_job_summary(job, output_root=output_root, status=status, resumed=resumed)
     job_json = job.out_dir / "job.json"
     done_marker = job.out_dir / ".done"
-    job_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if job.checkpoint_enabled and summary["status"] == "done" and (
+        not all(item.status == "done" for item in job.passes) or not summary.get("report_hashes")
+    ):
+        summary["status"] = "failed"
+        summary["failure_reason"] = job.failure_reason or "Missing or invalid pass reports"
+    if summary["status"] != "done":
+        done_marker.unlink(missing_ok=True)
+    atomic_write_text(job_json, json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     if summary["status"] == "done":
-        done_marker.write_text("done\n", encoding="utf-8")
-    elif done_marker.exists():
-        try:
-            done_marker.unlink()
-        except OSError:
-            pass
+        atomic_write_text(done_marker, "done\n")
     return summary
 
 
@@ -1379,6 +1811,8 @@ def path_from_result_url(url: str) -> str:
 
 def summary_result_json_path(output_root: Path, summary: dict[str, object]) -> Path | None:
     """Resolve the result.json path stored in a job summary."""
+    if summary.get("has_current_results") is False:
+        return None
     outputs = summary.get("outputs", {})
     outputs = outputs if isinstance(outputs, dict) else {}
     raw_path = outputs.get("json")
@@ -1449,6 +1883,8 @@ def aggregate_recursive_subscan_outputs(job: FfufJob) -> None:
         result_json = subscan.out_dir / "result.json"
         read_result = read_ffuf_result_json(result_json)
         items = read_result.items if read_result.state in {"readable", "empty"} else []
+        if job.checkpoint_enabled and job.passes[subscan.index - 1].status != "done":
+            items = []
         aggregated_results.extend(dict(item) for item in items)
         subscan_summaries.append(
             {
@@ -1802,7 +2238,7 @@ def prepare_job(
     per_host_rate = rate_per_host(args.rate, getattr(args, "parallel", 1))
     subscans: list[FfufSubscan] = []
 
-    if recursion_depth > 0 and len(job_spec.seed_urls) > 1:
+    if len(job_spec.seed_urls) > 1:
         subscan_root = out_dir / "subscans"
         single_seed_total = estimate_single_seed_requests(args.wordlist, extensions)
         used_subscan_names: set[str] = set()
@@ -1815,8 +2251,11 @@ def prepare_job(
             subscan_out_dir = subscan_root / subscan_name
             if write_files:
                 subscan_out_dir.mkdir(parents=True, exist_ok=True)
+            subscan_seeds = subscan_out_dir / "paths.txt"
+            if write_files and recursion_depth == 0:
+                subscan_seeds.write_text(seed_url + "\n", encoding="utf-8")
             subscan_cmd = build_ffuf_cmd(
-                seeds_file=seeds_file,
+                seeds_file=seeds_file if recursion_depth else subscan_seeds,
                 wordlist=args.wordlist,
                 out_dir=subscan_out_dir,
                 rate=per_host_rate,
@@ -1826,7 +2265,7 @@ def prepare_job(
                 follow_redirects=args.follow_redirects,
                 recursion_depth=recursion_depth,
                 recursion_strategy=recursion_strategy,
-                base_url=seed_url,
+                base_url=seed_url if recursion_depth else None,
             )
             subscans.append(
                 FfufSubscan(
@@ -1870,7 +2309,7 @@ def prepare_job(
         seeds_text=seeds_text.replace("\n", os.linesep) if not write_files else None,
     )
 
-    return FfufJob(
+    job = FfufJob(
         job_id=job_id,
         name=job_spec.name,
         seeds_file=seeds_file,
@@ -1887,7 +2326,11 @@ def prepare_job(
         subscans=subscans,
         subscan_total_count=max(1, len(subscans)),
         subscan_totals=subscan_totals,
+        seed_urls=list(job_spec.seed_urls),
     )
+    job.passes = [FfufPass(item.index, item.seed_url, item.out_dir, item.cmd, item.estimated_total)
+                  for item in subscans] if subscans else [FfufPass(1, job_spec.seed_urls[0], out_dir, cmd, total)]
+    return job
 
 
 def parse_extensions(raw: str) -> list[str]:
@@ -2018,7 +2461,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip jobs whose result.json already exists and is non-empty.",
+        help="Resume verified completed seed passes when inputs and options match; restart interrupted passes.",
     )
     parser.add_argument(
         "--show-cmds",
@@ -2099,129 +2542,285 @@ def render_status(
     return len(lines)
 
 
+def selected_origin_job(
+    jobs: list[FfufJob], running: list[FfufJob], waiting: list[FfufJob],
+    host: str, job_id: int | None = None,
+) -> FfufJob | None:
+    """An explicit origin stays selected; otherwise follow the host's active job."""
+    host_jobs = [job for job in jobs if job_host_key(job) == host]
+    if job_id is not None:
+        selected = next((job for job in host_jobs if job.job_id == job_id), None)
+        if selected is not None:
+            return selected
+    return next((job for job in running if job_host_key(job) == host), None) or next(
+        (job for job in waiting if job_host_key(job) == host), None
+    ) or (host_jobs[-1] if host_jobs else None)
+
+
+def dashboard_job_state(job: FfufJob, running: list[FfufJob]) -> str:
+    if job.finished:
+        return "failed" if job.failed else "stopped" if job.stopped else "done"
+    if job.subscan_pending:
+        return "paused"
+    return "running" if job in running else "waiting"
+
+
+def display_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "--"
+    seconds = max(0, int(seconds))
+    return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+
+
+def display_text(value: object) -> str:
+    """Keep terminal control characters out of untrusted result/URL fields."""
+    return "".join(char if char.isprintable() else " " for char in str(value))
+
+
+def task_progress_text(label: str, done: int | None, total: int | None) -> str:
+    if done is None or not total:
+        return f"{label}: waiting for statistics"
+    fraction = min(1.0, max(0.0, done / total))
+    filled = int(fraction * 14)
+    return f"{label}: {done:,}/{total:,} {'━' * filled}{'─' * (14 - filled)} {fraction:.0%}"
+
+
 def build_dashboard(
     jobs: list[FfufJob], running: list[FfufJob], waiting: list[FfufJob],
     finished: list[FfufJob], skipped: int, selected_host: str, parallel: int,
     total_rate: int, messages: list[str], prompt: str, paused: bool,
     *, width: int = 120, height: int = 30, show_log: bool = False,
+    selected_job_id: int | None = None, focus: str = "hosts", expanded: bool = False,
+    detail_offset: int = 0,
+    selected_pass_index: int | None = None,
 ):
-    """Build a terminal-size-aware dashboard from scheduler state only."""
+    """Render host/origin navigation and live telemetry without changing jobs."""
     from rich.layout import Layout
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
 
+    def text_lines(lines):
+        return Text("\n".join(display_text(line) for line in lines), no_wrap=True, overflow="ellipsis")
+
     groups: dict[str, list[FfufJob]] = {}
     for job in jobs:
         groups.setdefault(job_host_key(job), []).append(job)
     hosts = list(groups)
-    active = {job_host_key(job) for job in running}
     share = rate_per_host(total_rate, parallel)
+    active = {job_host_key(job) for job in running}
     compact = width < 100
-    measured = sum(job.progress_rate for job in running)
-    errors = sum(job.ffuf_errors or 0 for job in jobs)
     header = (
         f"Hosts {len(active)}/{parallel} active | Origins {len(finished)}/{len(jobs)} done | Skipped {skipped}\n"
-        f"Total rate {total_rate} / {parallel} slots = {share}/IP | Rounded max {share * parallel}/s"
+        f"Rate {total_rate}/{parallel} slots = {share}/IP | Rounded max {share * parallel}/s"
     )
-    if not compact:
-        header += f" | Measured {measured:.1f}/s | Errors {errors}"
-    header_height = 5 if compact else 4
-    event_height = 5 if height < 28 else 7
-    footer_height = 4
+    if width >= 140:
+        measured = f"{sum(job.progress_rate for job in running):.1f}/s" if any(job.saw_progress for job in running) else "--"
+        header += f" | Actual {measured} | Errors {sum(job.ffuf_errors or 0 for job in jobs)}"
+    header_height, footer_height = 4, (5 if compact else 4)
+    event_height = 0 if expanded else (5 if height < 36 else 6)
     body_height = max(4, height - header_height - event_height - footer_height)
-    visible = max(1, (body_height // 2 if compact else body_height) - 3)
-    selected_index = hosts.index(selected_host) if selected_host in hosts else 0
-    offset = max(0, min(selected_index - visible // 2, len(hosts) - visible))
+    selected = selected_origin_job(jobs, running, waiting, selected_host, selected_job_id)
+    origin_job = selected
+    pass_item = selected.passes[selected_pass_index] if selected and selected_pass_index is not None and 0 <= selected_pass_index < len(selected.passes) else None
+    host_jobs = groups.get(selected_host, [])
+    origin_height = min(7, max(4, body_height // 3))
+    if expanded:
+        origin_height = 4 if height < 38 else 6
+
+    # Host list and independently selectable origins of that host.
     table = Table(expand=True, box=None, padding=(0, 1))
     for title in ("IP / Host", "State", "Origins", "Limit/s"):
         table.add_column(title, no_wrap=True, overflow="ellipsis")
-    for host in hosts[offset: offset + visible]:
-        host_jobs = groups[host]
-        completed = sum(job.finished for job in host_jobs)
-        if host in active:
-            state = "paused" if any(job.subscan_pending for job in host_jobs) else "running"
-        elif any(not job.finished for job in host_jobs):
-            state = "waiting"
-        else:
-            state = "failed" if any(job.failed for job in host_jobs) else "stopped" if any(job.stopped for job in host_jobs) else "done"
+    host_height = body_height - origin_height if not expanded else body_height
+    visible = max(1, host_height - 3)
+    index = hosts.index(selected_host) if selected_host in hosts else 0
+    offset = max(0, min(index - visible // 2, len(hosts) - visible))
+    for host in hosts[offset:offset + visible]:
+        host_group = groups[host]
+        states = [dashboard_job_state(job, running) for job in host_group]
+        state = next((value for value in ("running", "paused", "waiting", "failed", "stopped") if value in states), "done")
         table.add_row(
-            Text(("> " if host == selected_host else "  ") + host),
+            Text(("> " if host == selected_host else "  ") + display_text(host)),
             Text(state, style={"running": "green", "failed": "red", "paused": "yellow", "done": "cyan"}.get(state, "")),
-            Text(f"{completed}/{len(host_jobs)}"), Text(str(share)),
+            Text(f"{sum(job.finished for job in host_group)}/{len(host_group)}"), Text(str(share)),
             style="bold cyan" if host == selected_host else "",
         )
+    origins = Table(expand=True, box=None, show_header=False, padding=(0, 0))
+    origins.add_column(no_wrap=True, overflow="ellipsis", ratio=1)
+    origins.add_column(no_wrap=True)
+    origin_index = host_jobs.index(selected) if selected in host_jobs else 0
+    origin_visible = max(1, origin_height - 2)
+    origin_offset = max(0, min(origin_index - origin_visible // 2, len(host_jobs) - origin_visible))
+    for job in host_jobs[origin_offset:origin_offset + origin_visible]:
+        chosen = job is selected
+        origins.add_row(
+            Text(("> " if chosen else "  ") + f"#{job.job_id} " + display_text(job.origin or job.name)),
+            Text(dashboard_job_state(job, running)), style="bold cyan" if chosen else "",
+        )
+    origins_panel = Panel(origins, title=Text(f"Origins ({origin_index + 1 if host_jobs else 0}/{len(host_jobs)})"),
+                          border_style="cyan" if focus == "origins" else "white")
 
-    host_jobs = groups.get(selected_host, [])
-    selected = next((job for job in running if job_host_key(job) == selected_host), None)
-    if selected is None:
-        selected = next((job for job in waiting if job_host_key(job) == selected_host), None)
-    if selected is None and host_jobs:
-        selected = host_jobs[-1]
-    detail_lines = ["Select an IP / host with the arrow keys."]
+    history = Table(expand=True, box=None, show_header=False, padding=(0, 0))
+    history.add_column(no_wrap=True, overflow="ellipsis")
+    history_height = max(4, body_height - origin_height)
+    pass_index = selected_pass_index if pass_item else (selected.active_subscan_index if selected else 0)
+    passes = selected.passes if selected else []
+    visible_passes = max(1, (history_height - 2) // 2)
+    pass_offset = max(0, min(pass_index - visible_passes // 2, len(passes) - visible_passes))
+    for item in passes[pass_offset:pass_offset + visible_passes]:
+        chosen = item.index - 1 == pass_index
+        path = urlsplit(item.seed_url).path or "/"
+        elapsed_pass = max(0.0, time.time() - item.started) if item.status == "running" else item.duration
+        history.add_row(Text(("> " if chosen else "  ") + f"#{item.index} {display_text(path)}", style="bold cyan" if chosen else ""))
+        history.add_row(Text(f"  {item.status} | {display_duration(elapsed_pass) if item.started else '--'} | {item.result_count} hits"))
+    history_panel = Panel(history, title=Text(f"Seed passes ({pass_index + 1 if passes else 0}/{len(passes)})"),
+                          border_style="cyan" if focus == "passes" else "white")
+    if pass_item and selected:
+        selected = inspection_job(selected, selected_pass_index)
+
+    lines = ["Select a host with ↑↓; Tab selects its origins."]
     if selected is not None:
-        subscan = active_subscan(selected)
-        seed = subscan.seed_url if subscan is not None else str(selected.seeds_file)
-        detail_lines = [
-            f"Origin: {selected.origin or selected.name}",
-            f"Seed: {seed}",
-            f"Progress: {selected.done_est}/{selected.total} known requests",
-            f"Pass: {selected.active_subscan_index + 1}/{selected.subscan_total_count} | Limit: {selected.rate}/s",
+        job = selected
+        now = time.time()
+        end = job.started + job.duration_seconds - job.previous_duration if job.finished else now
+        state = pass_item.status if pass_item else dashboard_job_state(job, running)
+        cmd = active_subscan(job).cmd if active_subscan(job) else job.cmd
+        template = job.task_template or command_option(cmd, "-u") or "URLFUZZ"
+        multi_seed = template == "URLFUZZ" and not job.passes
+        seed_count = len(job.seed_urls) or 1
+        if job.passes:
+            base = job.passes[job.active_subscan_index].seed_url
+        elif template == "URLFUZZ":
+            base = f"{seed_count} seed URLs (URL × FUZZ)"
+        else:
+            base = template.removesuffix("FUZZ")
+        current = f"{job.ffuf_job_current}/{job.ffuf_job_total} known" if job.ffuf_job_current else "awaiting ffuf"
+        speed = f"{job.progress_rate:.1f}/s" if job.task_done is not None and state == "running" and not job.subscan_pending else "--"
+        age = f"{max(0, int(end - job.last_progress_time))}s ago" if job.last_progress_time else "awaiting progress"
+        if job.finished:
+            age = "finished" if state == "done" else state
+        elapsed = display_duration(job.previous_duration + end - job.started if job.started else None)
+        started = time.strftime("%H:%M:%S", time.localtime(job.started)) if job.started else "--"
+        errors = str(job.ffuf_errors) if job.ffuf_errors is not None else "--"
+        remaining = max(0, (job.task_total or 0) - (job.task_done or 0))
+        fresh_speed = job.progress_rate > 0 and job.last_progress_time and now - job.last_progress_time < 5
+        eta = display_duration(remaining / job.progress_rate if fresh_speed and state == "running" else None)
+        wordlists = [cmd[index + 1].removesuffix(":FUZZ") for index, arg in enumerate(cmd[:-1])
+                     if arg == "-w" and cmd[index + 1].endswith(":FUZZ")]
+        depth = command_option(cmd, "-recursion-depth") or "0"
+        strategy = command_option(cmd, "-recursion-strategy") or "default"
+        lines = [
+            f"Origin: {job.origin or job.name}",
+            f"{'Pass' if pass_item else 'State'}: {state} | Started: {started} | Elapsed: {elapsed}",
+            f"Seed: {base}",
+            f"Template: {template}",
+            (f"Batch: {seed_count} seeds" if multi_seed else f"Seed pass: {job.active_subscan_index + 1}/{job.subscan_total_count}") + f" | ffuf task: {current}",
+            task_progress_text("Task", job.task_done, job.task_total),
+            task_progress_text("Batch" if multi_seed else "Seed", job.seed_done if job.task_done is not None else None, job.seed_total),
+            task_progress_text("Origin (known)", origin_job.done_est if origin_job.started or origin_job.partial_resumed else None, origin_job.total),
+            f"Limit: {job.rate}/s | Actual: {speed} | Errors: {errors} | Task ETA: {eta}",
+            f"Last advance: {age} | Pass elapsed: {display_duration(end - job.pass_started if job.pass_started else None)}",
         ]
-        if not compact:
-            fraction = min(1.0, max(0.0, selected.done_est / max(1, selected.total)))
-            filled = int(fraction * 24)
-            detail_lines.insert(3, "━" * filled + "─" * (24 - filled) + f" {fraction:.0%} known")
-            if selected.finished:
-                state, heartbeat = ("failed" if selected.failed else "stopped" if selected.stopped else "done"), ""
-            elif selected in waiting:
-                state, heartbeat = "waiting", ""
-            else:
-                state, heartbeat = running_job_display_state(selected, time.time())
-            detail_lines += [
-                f"State: {'paused between passes' if selected.subscan_pending else state} {heartbeat}",
-                f"Measured: {selected.progress_rate:.1f}/s | Errors: {selected.ffuf_errors if selected.ffuf_errors is not None else '-'}",
-                f"Hits (completed origins): {sum(job.result_count or 0 for job in host_jobs if job.finished)}",
-                "Recursion may increase the known request total.",
+        if expanded or body_height >= 24:
+            lines += [
+                f"Wordlist: {', '.join(wordlists) or '--'}",
+                f"Extensions: {command_option(cmd, '-e') or 'none'} | Recursion: depth {depth}, {strategy}",
+                f"Follow redirects: {'yes' if '-r' in cmd else 'no'} | Task elapsed: {display_duration(end - job.task_started if job.task_started else None)}",
             ]
+            lines[-1] += " | Totals may grow"
+        else:
+            lines[-1] += " | Enter: settings / details"
+        if multi_seed and expanded:
+            lines.append("Seeds: " + ", ".join(job.seed_urls[:3]) + (" …" if seed_count > 3 else ""))
 
-    event_lines = messages[-max(1, event_height - 2):] or ["Waiting for events..."]
-    event_title = "Events"
+    # Live matches belong only to the selected origin, including completed passes.
+    match_table = Table(expand=True, box=None, padding=(0, 1))
+    for title in ("Status", "Bytes", "Words", "Path / redirect"):
+        match_table.add_column(title, no_wrap=True, overflow="ellipsis", ratio=1 if title == "Path / redirect" else None)
+    detail_height = min(len(lines) + 2, max(6, body_height - 5))
+    matches_height = max(4, body_height - detail_height)
+    if expanded:
+        detail_height = min(len(lines) + 2, max(6, body_height - origin_height - 4))
+        matches_height = max(4, body_height - origin_height - detail_height)
+    compact_detail_height = 0
+    if compact and not expanded:
+        compact_detail_height = min(6, body_height - origin_height - 4) if body_height >= 12 else 0
+        matches_height = max(4, body_height - origin_height - compact_detail_height)
+    recent = selected.recent_matches[-max(1, matches_height - 3):] if selected else []
+    for item in recent:
+        raw_url = str(item.get("url") or "")
+        if selected and raw_url.startswith(selected.origin):
+            path = "/" + raw_url[len(selected.origin):]
+        else:
+            path = raw_url
+        redirect = item.get("redirectlocation")
+        if redirect:
+            path += " → " + str(redirect)
+        status = str(item.get("status", "--"))
+        match_table.add_row(Text(status, style="green" if status.startswith("2") else "yellow" if status.startswith("3") else "red"),
+                            Text(str(item.get("length", "--"))), Text(str(item.get("words", "--"))), Text(display_text(path)))
+    hits = (selected.result_count if selected.finished and selected.result_count is not None else selected.live_hits) if selected else 0
+    match_content = match_table if recent else Text("No matches yet for this origin.")
+    matches_panel = Panel(match_content, title=Text(f"Matches — pass #{pass_item.index}: {hits}" if pass_item else f"Matches — this origin: {hits}"))
     if show_log and selected is not None:
-        event_title = f"ffuf stderr: {selected.name}"
         try:
+            if pass_item and pass_item.status == "queued":
+                raise FileNotFoundError
             with selected.stderr_log.open("rb") as handle:
                 handle.seek(0, os.SEEK_END)
-                handle.seek(max(0, handle.tell() - 8192))
-                log_lines = handle.read().decode("utf-8", errors="replace").replace("\r", "\n").splitlines()
-            event_lines = [line for line in log_lines if line.strip()][-max(1, event_height - 2):] or ["No log output yet."]
+                log_start = pass_item.stderr_start if pass_item and pass_item.status == "running" else 0
+                handle.seek(max(log_start, handle.tell() - 8192))
+                log_lines = ANSI_RE.sub("", handle.read().decode("utf-8", errors="replace")).replace("\r", "\n").replace(":: Progress:", "\n:: Progress:").splitlines()
+            log_lines = [line for line in log_lines if line.strip()]
         except OSError:
-            event_lines = ["Log will appear when this origin starts."]
+            log_lines = ["Log will appear when this origin starts."]
+        matches_panel = Panel(text_lines(log_lines[-max(1, matches_height - 2):]), title="Selected origin: ffuf stderr")
 
     root = Layout(name="root", size=max(12, height))
+    controls = "↑↓ move | Tab hosts/origins/passes | Enter expand | Esc back | p↵ queue | l↵ logs | s↵ stop IP | Ctrl+C"
+    if compact:
+        controls = "↑↓ move | Tab focus | Enter expand | Esc back\np↵ queue | l↵ log | s↵ stop IP | Ctrl+C"
     if height < 20:
         root.split_column(
-            Layout(Panel(Text(f"Rate {total_rate}/{parallel} = {share}/IP | Origins {len(finished)}/{len(jobs)}"), title="FFuFScan"), size=3),
-            Layout(Panel(table, title="Hosts")),
+            Layout(Panel(Text(f"Rate {total_rate}/{parallel} = {share}/IP"), title="FFuFScan"), size=3),
+            Layout(Panel(text_lines([f"Host: {selected_host}", f"Origin: {selected.origin if selected else '--'}",
+                                    "Enlarge terminal for detailed progress."]))),
             Layout(Panel(Text(prompt or "Ctrl+C exits")), size=3),
         )
         return root
     root.split_column(
-        Layout(Panel(Text(header), title="FFuFScan | QUEUE PAUSED" if paused else "FFuFScan"), size=header_height),
+        Layout(Panel(text_lines(header.splitlines()), title="FFuFScan | QUEUE PAUSED" if paused else "FFuFScan"), size=header_height),
         Layout(name="body"),
-        Layout(Panel(Text.from_ansi("\n".join(event_lines)), title=event_title), size=event_height),
-        Layout(name="footer", size=footer_height),
+        *([] if expanded else [Layout(Panel(text_lines(messages[-max(1, event_height - 2):] or ["Waiting for events..."]), title="Events"), size=event_height)]),
+        Layout(Panel(text_lines(controls.splitlines() + ([prompt] if prompt else [])), title="Controls"), size=footer_height),
     )
-    host_panel = Layout(Panel(table, title=Text(f"Hosts ({len(hosts)})")), name="hosts")
-    detail_panel = Layout(Panel(Text("\n".join(detail_lines)), title=Text(selected_host or "Details")), name="details")
-    if compact:
-        root["body"].split_column(host_panel, detail_panel)
+    page_size = max(1, detail_height - 2)
+    detail_offset = min(max(0, detail_offset), max(0, len(lines) - page_size))
+    detail_title = selected_host or "Origin details"
+    if expanded and len(lines) > page_size:
+        detail_title += f" | {detail_offset + 1}-{min(len(lines), detail_offset + page_size)}/{len(lines)} PgUp/PgDn"
+    details = Layout(Panel(text_lines(lines[detail_offset:]), title=Text(detail_title)), name="details", size=detail_height)
+    matches = Layout(matches_panel, name="matches")
+    host_panel = Layout(Panel(table, title=Text(f"Hosts ({len(hosts)})"), border_style="cyan" if focus == "hosts" else "white"))
+    if expanded:
+        if passes and not compact:
+            root["body"].split_column(Layout(origins_panel, size=origin_height), Layout(name="inspection"))
+            root["inspection"].split_row(Layout(history_panel, ratio=2), Layout(name="pass_details", ratio=5))
+            root["pass_details"].split_column(details, matches)
+        else:
+            root["body"].split_column(Layout(history_panel if passes else origins_panel, size=origin_height), details, matches)
+    elif compact:
+        # A narrow terminal remains useful; Enter gives the detailed view.
+        root["body"].split_column(
+            Layout(origins_panel, size=origin_height),
+            *([Layout(Panel(text_lines(lines[:4]), title=Text(selected_host)), size=compact_detail_height)] if compact_detail_height else []),
+            matches,
+        )
     else:
-        root["body"].split_row(host_panel, detail_panel)
-    controls = "↑↓ select | p↵ queue | l↵ logs | s↵ stop IP | Ctrl+C"
-    if not compact:
-        controls += " | s <id|host>↵ stop target"
-    root["footer"].update(Panel(Text(controls + ("\n" + prompt if prompt else "")), title="Controls"))
+        root["body"].split_row(Layout(name="navigation", ratio=2), Layout(name="telemetry", ratio=3))
+        root["navigation"].split_column(host_panel, Layout(origins_panel, size=origin_height))
+        root["telemetry"].split_column(details, matches)
     return root
 
 
@@ -2235,6 +2834,11 @@ class FfufDashboard:
         self.hosts = list(dict.fromkeys(job_host_key(job) for job in jobs))
         self.selected_host = self.hosts[0] if self.hosts else ""
         self.show_log = False
+        self.focus = "hosts"
+        self.expanded = False
+        self.selected_origins: dict[str, int] = {}
+        self.selected_passes: dict[int, int] = {}
+        self.detail_offset = 0
         self.enabled = mode != "plain" and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
         self.live = None
         if mode == "dashboard" and not self.enabled:
@@ -2261,9 +2865,53 @@ class FfufDashboard:
             self.live.stop()
 
     def move_selection(self, direction: int) -> None:
+        self.detail_offset = 0
+        if self.focus == "passes":
+            job_id = self.selected_origins.get(self.selected_host)
+            job = next((item for item in self.jobs if item.job_id == job_id), None)
+            if job and job.passes:
+                index = self.selected_passes.get(job.job_id, job.active_subscan_index)
+                self.selected_passes[job.job_id] = (index + direction) % len(job.passes)
+            return
+        if self.focus == "origins":
+            host_jobs = [job for job in self.jobs if job_host_key(job) == self.selected_host]
+            if host_jobs:
+                job_id = self.selected_origins.get(self.selected_host)
+                index = next((index for index, job in enumerate(host_jobs) if job.job_id == job_id), 0)
+                self.selected_origins[self.selected_host] = host_jobs[(index + direction) % len(host_jobs)].job_id
+            return
         if self.hosts:
             index = self.hosts.index(self.selected_host)
             self.selected_host = self.hosts[(index + direction) % len(self.hosts)]
+
+    def navigate(self, command: str, running: list[FfufJob], waiting: list[FfufJob]) -> bool:
+        """Handle immediate navigation keys independently of scan controls."""
+        if command not in {"__up__", "__down__", "__tab__", "__enter__", "__escape__", "__page_up__", "__page_down__"}:
+            return False
+        if not self.enabled:
+            return True
+        if command in {"__page_up__", "__page_down__"}:
+            self.detail_offset = min(20, max(0, self.detail_offset + (-4 if command == "__page_up__" else 4)))
+        elif command == "__escape__":
+            self.expanded = False
+            self.focus = "hosts"
+        elif command in {"__tab__", "__enter__"}:
+            self.detail_offset = 0
+            selected = selected_origin_job(self.jobs, running, waiting, self.selected_host,
+                                           self.selected_origins.get(self.selected_host))
+            if selected:
+                self.selected_origins[self.selected_host] = selected.job_id
+            if command == "__enter__":
+                self.expanded = not self.expanded
+                self.focus = "passes" if self.expanded and selected and selected.passes else "origins" if self.expanded else "hosts"
+            else:
+                self.focus = {"hosts": "origins", "origins": "passes", "passes": "hosts"}[self.focus]
+                self.expanded = self.focus == "passes"
+            if self.focus == "passes" and selected:
+                self.selected_passes.setdefault(selected.job_id, selected.active_subscan_index)
+        else:
+            self.move_selection(-1 if command == "__up__" else 1)
+        return True
 
     def update(self, running, waiting, finished, skipped, messages, prompt, paused) -> None:
         if self.live is not None:
@@ -2272,6 +2920,10 @@ class FfufDashboard:
                 self.jobs, running, waiting, finished, skipped, self.selected_host,
                 self.parallel, self.rate, messages, prompt, paused,
                 width=size.width, height=size.height, show_log=self.show_log,
+                selected_job_id=self.selected_origins.get(self.selected_host),
+                focus=self.focus, expanded=self.expanded,
+                detail_offset=self.detail_offset,
+                selected_pass_index=self.selected_passes.get(self.selected_origins.get(self.selected_host)) if self.expanded else None,
             ), refresh=True)
 
 
@@ -2352,6 +3004,11 @@ def main(argv: list[str] | None = None) -> int:
                 if args.dry_run:
                     print(f"# Skip {job.name}: matches --resume state")
                 continue
+            restored = load_partial_resume(job)
+            if restored:
+                print(f"# Resume {job.name}: {restored}/{len(job.passes)} verified seed passes completed")
+                if args.dry_run and restored == len(job.passes):
+                    print(f"# Rebuild {job.name} aggregate reports from verified passes; no ffuf requests needed")
         jobs.append(job)
         if args.dry_run:
             print(
@@ -2361,7 +3018,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"# Planned seed file: {job.seeds_file}")
             for seed_url in spec.seed_urls:
                 print(f"#   {seed_url}")
-            for command in job_commands(job):
+            for index, command in enumerate(job_commands(job)):
+                if job.passes[index].status == "done":
+                    print(f"# Skip seed pass {index + 1}: verified checkpoint")
+                    continue
+                if job.subscans and args.recursion_depth == 0:
+                    print(f"# Planned seed file: {job.subscans[index].out_dir / 'paths.txt'}")
+                    print(f"#   {job.subscans[index].seed_url}")
                 print("$ " + shlex.join(command))
 
     if args.dry_run:
@@ -2377,8 +3040,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.show_cmds:
         for job in jobs:
-            for command in job_commands(job):
-                print("$ " + shlex.join(command))
+            for index, command in enumerate(job_commands(job)):
+                if job.passes[index].status != "done":
+                    print("$ " + shlex.join(command))
 
     if not jobs:
         write_index_files(args.output_dir, summaries)
@@ -2407,14 +3071,26 @@ def main(argv: list[str] | None = None) -> int:
     paused = False
     last_plain_update = 0.0
     last_plain_counts: tuple[int, ...] = ()
+    interrupted = False
+    interrupt_requested = False
+    old_sigint = signal.getsignal(signal.SIGINT)
+
+    def request_interrupt(signum, frame):
+        nonlocal interrupt_requested
+        interrupt_requested = True
+
+    # Handle Ctrl+C at scan-loop boundaries, including while Popen or a state
+    # replacement is in progress. Every returned child remains owned/reapable.
+    signal.signal(signal.SIGINT, request_interrupt)
 
     try:
         dashboard.start()
         try:
             while waiting or running:
+                if interrupt_requested:
+                    raise KeyboardInterrupt
                 for command in console.read_commands():
-                    if command in {"__up__", "__down__"}:
-                        dashboard.move_selection(-1 if command == "__up__" else 1)
+                    if dashboard.navigate(command, running, waiting):
                         continue
                     if command.lower() in {"p", "pause"}:
                         paused = not paused
@@ -2449,6 +3125,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
                 while waiting and len(running) < args.parallel and not paused:
+                    if interrupt_requested:
+                        raise KeyboardInterrupt
                     next_index = next_available_job_index(waiting, running)
                     if next_index is None:
                         break
@@ -2466,8 +3144,10 @@ def main(argv: list[str] | None = None) -> int:
                     control_messages.append(f"{time.strftime('%H:%M:%S')} Start {job.origin} on {job.host_key}, rate={job.rate}")
 
                 for job in list(running):
-                    update_job_progress_from_stderr(job)
-                    reap_job(job, start_next=not paused)
+                    if not job.finished:
+                        update_job_progress_from_stderr(job)
+                        update_job_matches(job)
+                        reap_job(job, start_next=not paused and not interrupt_requested)
                     if not job.finished:
                         continue
                     running.remove(job)
@@ -2480,24 +3160,10 @@ def main(argv: list[str] | None = None) -> int:
                         if not args.keep_going:
                             abort_requested = True
                             for other in list(running):
-                                if other.proc and other.proc.poll() is None:
-                                    try:
-                                        other.proc.terminate()
-                                    except OSError:
-                                        pass
-                                    try:
-                                        other.proc.wait(timeout=2)
-                                    except subprocess.TimeoutExpired:
-                                        try:
-                                            other.proc.kill()
-                                        except OSError:
-                                            pass
-                                    other.retcode = other.proc.returncode
-                                other.finished = True
+                                stop_job(other, "fail-fast: another origin failed")
+                                other.stopped = False
                                 other.failed = True
-                                other.duration_seconds = max(0.0, time.time() - other.started)
-                                aggregate_recursive_subscan_outputs(other)
-                                other.result_count = read_result_count(other.out_dir / "result.json")
+                                write_job_state(other, args.output_dir, status="aborted")
                                 running.remove(other)
                                 finished.append(other)
                                 aborted_jobs.append(other)
@@ -2543,10 +3209,15 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             dashboard.stop()
             print("Interrupted.", file=sys.stderr)
-            return 130
+            interrupted = True
     finally:
         try:
             for job in running:
+                if job.proc and job.proc.poll() == 0 and not interrupted and not interrupt_requested:
+                    reap_job(job, start_next=False)
+                    if job.finished:
+                        finished.append(job)
+                        continue
                 if job.proc and job.proc.poll() is None:
                     try:
                         job.proc.terminate()
@@ -2556,25 +3227,40 @@ def main(argv: list[str] | None = None) -> int:
                         job.proc.wait(timeout=2)
                     except OSError:
                         pass
+                update_job_progress_from_stderr(job)
+                update_job_matches(job, drain=True)
+                finish_pass(job, "interrupted")
+                job.duration_seconds = job.previous_duration + max(0.0, time.time() - job.started)
+                aggregate_recursive_subscan_outputs(job)
+                job.result_count = read_result_count(job.out_dir / "result.json")
+                write_job_state(job, args.output_dir, status="interrupted")
         finally:
             try:
                 dashboard.stop()
             finally:
                 console.stop()
+                signal.signal(signal.SIGINT, old_sigint)
         if last_rendered:
             sys.stdout.write("\n")
             sys.stdout.flush()
 
-    for job in finished:
+    for job in jobs:
+        job.checkpoint_enabled = bool(job.passes)
         if job.stopped:
             summaries.append(write_job_state(job, output_root=args.output_dir, status="stopped"))
         elif job.failed and job in aborted_jobs:
             summaries.append(write_job_state(job, output_root=args.output_dir, status="aborted"))
+        elif not job.finished:
+            summaries.append(write_job_state(job, output_root=args.output_dir, status="interrupted" if job.started else "queued"))
         else:
             summaries.append(write_job_state(job, output_root=args.output_dir))
 
     write_index_files(args.output_dir, summaries)
     write_unique_paths_html(args.output_dir, summaries)
+
+    if interrupted:
+        print(f"Checkpoint saved; resume with the same options and --resume. Reports: {args.output_dir}")
+        return 130
 
     print(
         f"FFUF finished: done={sum(not job.failed and not job.stopped for job in finished)} "

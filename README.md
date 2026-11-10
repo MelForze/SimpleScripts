@@ -60,13 +60,52 @@ some slots are idle. For example, `-p 5 -r 1000` gives 200/s per host; `-p 3 -r 
 gives 334/s each (1002/s across three occupied slots due to rounding). This is
 ffuf's request-rate limit; following redirects can add HTTP exchanges.
 
-On a terminal, FFuFScan displays a dashboard with host queues, selected-origin
-details, progress and recent events. Use `--ui plain` for the previous text view
-or `--ui dashboard` to require the full-screen view. Arrow keys select a host;
-`p` + Enter pauses/resumes new jobs and recursive passes, `l` + Enter toggles its
-stderr log, and `s` + Enter stops the selected host and its queued origins.
-`s <id|host>` + Enter still targets a specific job or host. Already-running ffuf
-passes continue during a queue pause. Redirected output uses plain logs.
+On a terminal, FFuFScan displays host queues, the origins of the selected host,
+and live details for the selected origin. Use `--ui plain` for text output or
+`--ui dashboard` to require the full-screen view.
+
+- Arrow keys select a host. Tab cycles through hosts, origins and seed passes;
+  arrow keys select an item in the focused list.
+- Enter expands origin details with its seed-pass history. A selected pass shows
+  its own status, elapsed time, matches and log, including completed passes.
+  Esc returns to the host view. PgUp/PgDn scroll details on small terminals.
+- `p` + Enter pauses/resumes new jobs and seed passes. Already-running ffuf
+  processes, including their internal recursive jobs, continue during a pause.
+- `l` + Enter toggles the selected origin's live matches/stderr panel.
+- `s` + Enter stops the selected **host and all its queued origins**, including
+  while inspecting one origin. `s <id|host>` + Enter targets a job ID or host.
+
+Details distinguish the current ffuf task, the seed pass, and the entire origin.
+Each seed runs as a separate sequential pass, including without recursion, so
+completed seeds can be resumed independently. The request URL/prefix semantics
+remain the same; starting ffuf for every seed adds process startup overhead.
+Expanded details include the wordlist, extensions,
+recursion/redirect settings, elapsed times, rate, errors and estimated time left
+for the current task. Statistics show as pending until ffuf reports them. Known
+totals can grow when ffuf discovers recursive jobs; task ETA is approximate.
+
+Matches arrive during the scan with status, bytes, words, URL path and redirect
+location. The count and recent rows belong to the selected origin, across its
+seed passes. ffuf's JSONL stdout is saved as `ffuf.matches.jsonl` in each origin's
+directory; the dashboard retains the latest 100 matches per origin and per pass
+in memory. Completed passes have their own logs in `subscans/`. Final
+`result.json/html/md/csv` reports remain available. Redirected output uses plain
+logs. Both carriage-return and concatenated ffuf progress updates are supported.
+
+FFuFScan writes `job.json` checkpoints atomically when a seed starts or finishes.
+Ctrl+C terminates/reaps running children, marks unfinished work as interrupted,
+and writes the summary reports. Completed passes also survive an abrupt parent
+process exit. Add `--resume` to the same command to reuse completed passes:
+paths, wordlist and command-option hashes must match, and all four pass reports
+must pass integrity checks. Empty match sets are valid completed passes.
+Interrupted/failed passes restart from their beginning, including ffuf's internal
+recursive queue; resuming at an exact word is not supported. Without `--resume`,
+the command starts a fresh scan. `--resume --dry-run` previews the remaining
+commands without changing state or reports. Older whole-origin checkpoints can
+still be skipped when their hashes match, but have no per-seed recovery history.
+The origin's `.done` marker is created only after every pass and its combined
+reports have been validated. Missing combined reports can be rebuilt from
+verified completed passes without sending the requests again.
 
 `-fr` with `-rd > 0` and the default recursion strategy is rejected before any
 jobs start. Add `-rs greedy` explicitly to combine recursion with redirect
