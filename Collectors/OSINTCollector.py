@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the subdomain/DNS commands from the local OSINT templates verbatim."""
+"""Run the agreed subdomain/DNS collection commands in order."""
 from __future__ import annotations
 
 import argparse
@@ -87,99 +87,83 @@ def redact(command: str) -> str:
     return re.sub(r'(?i)(X-API-Key:\s*)[^"\s]+', r'\1[REDACTED]', command)
 
 
-def template_blocks(path: Path) -> list[tuple[str, str]]:
-    """Read bash blocks with their nearest heading; never reformat commands."""
-    heading = ''
-    blocks = []
-    body = None
-    for line in path.read_text(encoding='utf-8').splitlines():
-        if body is not None:
-            if line == '```':
-                blocks.append((heading, '\n'.join(body)))
-                body = None
-            else:
-                body.append(line)
-        elif line == '```bash':
-            body = []
-        elif line.startswith('#'):
-            heading = line.lstrip('#').strip()
-    if body is not None:
-        raise ValueError(f'Unclosed bash block: {path}')
-    return blocks
-
-
-def selected_lines(body: str, marker: str | None = None) -> list[str]:
-    if marker:
-        prefix, separator, body = body.partition('# ' + marker + '\n')
-        if not separator:
-            raise ValueError(f'Template is missing variant: {marker}')
-        body = body.split('\n# ', 1)[0]
-    return [line for line in body.splitlines() if line.strip() and not line.lstrip().startswith('#')]
-
-
-def load_steps(directory: Path) -> dict[str, list[Step]]:
-    passive_blocks = template_blocks(directory / 'Passive Actions.md')
-    passive = []
-    for heading, body in passive_blocks:
-        if heading.startswith('[DnsDumpster]'):
-            title, tools = 'DNSDumpster', ('curl', 'jq', 'tr', 'sort', 'cat', 'sleep')
-        elif heading == 'Certificates  - crt.sh':
-            title, tools = 'crt.sh', ('curl', 'jq', 'sed', 'tr', 'sort', 'cat', 'sleep')
-        elif heading == 'Subfinder':
-            title, tools = heading, ('subfinder',)
-        elif heading == 'Findomain':
-            title, tools = heading, ('findomain',)
-        elif heading == 'Assetfinder':
-            title, tools = heading, ('assetfinder', 'cat', 'sort')
-        elif heading == 'BBOT':
-            commands = selected_lines(body)
-            if len(commands) != 2:
-                raise ValueError('Expected BBOT command and cp in passive template')
-            passive.append(Step('BBOT passive', commands[0], ('bbot_passive/subdomains.txt',), ('docker',)))
-            passive.append(Step('Copy BBOT passive', commands[1], (PASSIVE_FILES[-1],), ('cp',)))
-            continue
-        else:
-            continue
-        commands = selected_lines(body, 'Domain list')
-        if len(commands) != 1 or len(passive) >= len(PASSIVE_FILES) - 1:
-            raise ValueError(f'Unexpected passive template block: {heading}')
-        passive.append(Step(title, commands[0], (PASSIVE_FILES[len(passive)],), tools))
-    if [step.title for step in passive] != ['DNSDumpster', 'crt.sh', 'Subfinder', 'Findomain', 'Assetfinder', 'BBOT passive', 'Copy BBOT passive']:
-        raise ValueError('Unsupported passive template structure/order; commands were not guessed')
-
-    specs = {
-        'BBOT': (None, [('BBOT active', ('bbot_active/subdomains.txt',), ('docker',)),
-                        ('Copy BBOT active', ('subdomains/subdomains_bbot_active.txt',), ('cp',))]),
-        'PureDNS': ('Domain list', [('PureDNS', ('puredns_subdomains.txt', 'puredns_massdns.txt', 'puredns_wildcards.txt'), ('puredns', 'massdns')),
-                                  ('Copy PureDNS', ('subdomains/subdomains_puredns.txt',), ('cp',))]),
-        'Prepare Domain List': (None, [('Prepare Domain List', ('domains_stage.txt',), ('sort', 'awk'))]),
-        'DNS Records': (None, [('DNS Records', ('dns_records.txt',), ('cat', 'dig'))]),
-        'SRV Discovery': ('Domain list', [('SRV Discovery', ('srv_records.txt',), ('cat', 'dig'))]),
-        'Extract Hosts from DNS Records': (None, [('Extract Hosts from DNS Records', ('dns_hosts_candidates.txt',), ('awk', 'sed', 'tr', 'sort'))]),
-        'Reverse DNS / PTR': ('IPv4 addresses from collected DNS records', [('Reverse DNS / PTR', ('ptr_hosts_candidates.txt',), ('awk', 'sort', 'dnsx', 'sed', 'tr'))]),
-        'Collect DNS Findings': (None, [('Collect DNS Findings', ('subdomains/subdomains_dns_extra.txt',), ('awk', 'sort'))]),
-        'AXFR': (None, [('Prepare AXFR', ('dns_zones_ns.txt',), ('awk', 'sort')),
-                        ('AXFR', ('axfr_result.txt',), ('dig',)),
-                        ('Collect AXFR', ('subdomains/subdomains_axfr.txt',), ('awk', 'sed', 'tr', 'sort'))]),
-        'Result of collection Domain scope': (None, [('Final domain collection', ('domains.txt',), ('awk', 'sort')),
-                       ('Resolve domains to IPv4', ('domains_resolved.txt',), ('host', 'awk', 'sort')),
-                       ('Extract unique IPv4 addresses', ('scope_ips.txt',), ('awk', 'sort'))]),
+def load_steps() -> dict[str, list[Step]]:
+    """The agreed domain-list commands, bundled with the standalone script."""
+    return {
+        'passive': [
+            Step('DNSDumpster',
+                 r'''for domain in $(cat top_domains.txt); do curl -fsS -H "X-API-Key: ${DNSDUMPSTER_API_KEY}" "https://api.dnsdumpster.com/domain/$domain" | jq -r '.a[].host'; sleep 2; done | tr '[:upper:]' '[:lower:]' | sort -u > ./subdomains/subdomains_dnsdumpster.txt''',
+                 (PASSIVE_FILES[0],), ('curl', 'jq', 'tr', 'sort', 'cat', 'sleep')),
+            Step('crt.sh',
+                 r'''for domain in $(cat top_domains.txt); do curl -fsS "https://crt.sh/?q=%25.$domain&output=json" | jq -r '.[].name_value'; sleep 2; done | sed 's/^\*\.//' | tr '[:upper:]' '[:lower:]' | sort -u > ./subdomains/subdomains_crtsh.txt''',
+                 (PASSIVE_FILES[1],), ('curl', 'jq', 'sed', 'tr', 'sort', 'cat', 'sleep')),
+            Step('Subfinder',
+                 'subfinder -dL top_domains.txt -all -o ./subdomains/subdomains_subfinder.txt',
+                 (PASSIVE_FILES[2],), ('subfinder',)),
+            Step('Findomain',
+                 'findomain -f top_domains.txt -u ./subdomains/subdomains_findomain.txt',
+                 (PASSIVE_FILES[3],), ('findomain',)),
+            Step('Assetfinder',
+                 'cat top_domains.txt | assetfinder --subs-only | sort -u > ./subdomains/subdomains_assetfinder.txt',
+                 (PASSIVE_FILES[4],), ('assetfinder', 'cat', 'sort')),
+            Step('BBOT passive',
+                 'docker run --platform linux/amd64 --rm -it --pull=always -v "$PWD":/work -w /work -v "$HOME/.config/bbot/secrets.yml":/root/.config/bbot/secrets.yml:ro blacklanternsecurity/bbot:stable -t top_domains.txt -p subdomain-enum -rf passive -n bbot_passive -o .',
+                 ('bbot_passive/subdomains.txt',), ('docker',)),
+            Step('Copy BBOT passive',
+                 'cp ./bbot_passive/subdomains.txt ./subdomains/subdomains_bbot_passive.txt',
+                 (PASSIVE_FILES[5],), ('cp',)),
+        ],
+        'active': [
+            Step('BBOT active',
+                 'docker run --platform linux/amd64 --rm -it --pull=always -v "$PWD":/work -w /work -v "$HOME/.config/bbot/secrets.yml":/root/.config/bbot/secrets.yml:ro blacklanternsecurity/bbot:stable -t top_domains.txt -p subdomain-enum -n bbot_active -o .',
+                 ('bbot_active/subdomains.txt',), ('docker',)),
+            Step('Copy BBOT active',
+                 'cp ./bbot_active/subdomains.txt ./subdomains/subdomains_bbot_active.txt',
+                 ('subdomains/subdomains_bbot_active.txt',), ('cp',)),
+            Step('PureDNS',
+                 'puredns bruteforce ~/selflists/dns/biggest_dnslist.txt -d top_domains.txt -r resolvers.txt -w puredns_subdomains.txt --write-massdns puredns_massdns.txt --write-wildcards puredns_wildcards.txt',
+                 ('puredns_subdomains.txt', 'puredns_massdns.txt', 'puredns_wildcards.txt'), ('puredns', 'massdns')),
+            Step('Copy PureDNS',
+                 'cp puredns_subdomains.txt ./subdomains/subdomains_puredns.txt',
+                 ('subdomains/subdomains_puredns.txt',), ('cp',)),
+            Step('Prepare Domain List',
+                 r'''sort -u top_domains.txt ./subdomains/subdomains_*.txt | awk 'NF' > domains_stage.txt''',
+                 ('domains_stage.txt',), ('sort', 'awk')),
+            Step('DNS Records',
+                 'for domain in $(cat domains_stage.txt); do for record in A AAAA CNAME NS MX TXT SOA; do dig "$domain" "$record" +noall +answer; done; done > dns_records.txt',
+                 ('dns_records.txt',), ('cat', 'dig')),
+            Step('SRV Discovery',
+                 'for domain in $(cat domains_stage.txt); do for service in _ldap._tcp _kerberos._tcp _kerberos._udp _sip._tcp _sips._tcp _autodiscover._tcp; do dig "${service}.${domain}" SRV +noall +answer; done; done > srv_records.txt',
+                 ('srv_records.txt',), ('cat', 'dig')),
+            Step('Extract Hosts from DNS Records',
+                 r'''awk '$3 == "IN" {if ($4 == "NS" || $4 == "CNAME") print $5; else if ($4 == "MX") print $6; else if ($4 == "SRV") print $8}' dns_records.txt srv_records.txt | sed 's/\.$//' | tr '[:upper:]' '[:lower:]' | awk 'NF' | sort -u > dns_hosts_candidates.txt''',
+                 ('dns_hosts_candidates.txt',), ('awk', 'sed', 'tr', 'sort')),
+            Step('Reverse DNS / PTR',
+                 r'''awk '$3 == "IN" && $4 == "A" {print $5}' dns_records.txt | sort -u | dnsx -ptr -resp-only -silent -rl 100 | sed 's/\.$//' | tr '[:upper:]' '[:lower:]' | sort -u > ptr_hosts_candidates.txt''',
+                 ('ptr_hosts_candidates.txt',), ('awk', 'sort', 'dnsx', 'sed', 'tr')),
+            Step('Collect DNS Findings',
+                 r'''awk 'NR == FNR {root = tolower($1); sub(/\.$/, "", root); if (root != "") roots[root] = 1; next} {for (root in roots) if ($0 == root || substr($0, length($0) - length(root)) == "." root) {print; next}}' top_domains.txt dns_hosts_candidates.txt ptr_hosts_candidates.txt | sort -u > ./subdomains/subdomains_dns_extra.txt''',
+                 ('subdomains/subdomains_dns_extra.txt',), ('awk', 'sort')),
+            Step('Prepare AXFR',
+                 r'''awk 'NR == FNR {root = tolower($1); sub(/\.$/, "", root); if (root != "") roots[root] = 1; next} $3 == "IN" && $4 == "NS" {zone = tolower($1); sub(/\.$/, "", zone); for (root in roots) if (zone == root || substr(zone, length(zone) - length(root)) == "." root) {print $1, $5; next}}' top_domains.txt dns_records.txt | sort -u > dns_zones_ns.txt''',
+                 ('dns_zones_ns.txt',), ('awk', 'sort')),
+            Step('AXFR',
+                 'while read -r zone ns; do dig @"$ns" "$zone" AXFR; done < dns_zones_ns.txt > axfr_result.txt 2>&1',
+                 ('axfr_result.txt',), ('dig',)),
+            Step('Collect AXFR',
+                 r'''awk '$3 == "IN" && $4 ~ /^(A|AAAA|CNAME)$/ && $1 !~ /\*/ {print $1}' axfr_result.txt | sed 's/\.$//' | tr '[:upper:]' '[:lower:]' | sort -u > ./subdomains/subdomains_axfr.txt''',
+                 ('subdomains/subdomains_axfr.txt',), ('awk', 'sed', 'tr', 'sort')),
+            Step('Final domain collection',
+                 r'''awk 'NR==FNR {if (NF) {roots[$0]=1; print}; next} NF {for (d in roots) if ($0==d || (length($0)>length(d) && substr($0,length($0)-length(d))=="."d)) {print; break}}' top_domains.txt ./subdomains/subdomains_*.txt | sort -u > domains.txt''',
+                 ('domains.txt',), ('awk', 'sort')),
+            Step('Resolve domains to IPv4',
+                 r'''while IFS= read -r domain; do host -t A "$domain" | awk -v dom="$domain" '$2 == "has" && $3 == "address" {print dom " - " $4}'; done < domains.txt | sort -u > domains_resolved.txt''',
+                 ('domains_resolved.txt',), ('host', 'awk', 'sort')),
+            Step('Extract unique IPv4 addresses',
+                 r'''awk '{print $3}' domains_resolved.txt | sort -u > scope_ips.txt''',
+                 ('scope_ips.txt',), ('awk', 'sort')),
+        ],
     }
-    active = []
-    headings = []
-    for heading, body in template_blocks(directory / 'Active Actions.md'):
-        if heading not in specs:
-            raise ValueError(f'Unsupported active template block: {heading}')
-        headings.append(heading)
-        marker, definitions = specs[heading]
-        commands = selected_lines(body, marker)
-        if len(commands) != len(definitions):
-            raise ValueError(f'Unexpected command count: {heading}')
-        for command, (title, outputs, tools) in zip(commands, definitions):
-            active.append(Step(title, command, outputs, tools))
-    if headings != list(specs):
-        raise ValueError('Unsupported active template structure/order; commands were not guessed')
-    return {'passive': passive, 'active': active}
 
 
 def config_help() -> str:
@@ -220,17 +204,20 @@ def config_help() -> str:
             return f'{p} [relative to tool workspace; existence not checked]'
         return f'{p} [{"exists" if p.is_file() else "missing"}]'
     return f'''Local configuration (paths only; key contents are never displayed):
+  DNSDumpster:
+    Environment: DNSDUMPSTER_API_KEY [{"set" if os.environ.get('DNSDUMPSTER_API_KEY', '').strip() else "missing"}].
+    Export your API key before passive/all collection. It is not read from MD.
   Subfinder ({origin}):
     API keys: {describe(defaults['provider-config'])}
     Settings: {describe(defaults['config'])}
     Overrides: SUBFINDER_PROVIDER_CONFIG / SUBFINDER_CONFIG (inherited unchanged).
     Fill provider-config.yaml with your providers' API keys; -all is already
-    in the template. Missing keys and API plan limits reduce coverage.
-  BBOT (exact Docker mount from the template):
+    in the command. Missing keys and API plan limits reduce coverage.
+  BBOT (agreed Docker mount):
     API keys: {describe(home / '.config/bbot/secrets.yml')}
     Container: /root/.config/bbot/secrets.yml (read-only).
     Global config: {describe(home / '.config/bbot/bbot.yml')}
-    bbot.yml is NOT mounted by the template, so host settings from it do not
+    bbot.yml is NOT mounted by the command, so host settings from it do not
     reach Docker. No mounts or command flags are added by the collector.
     Native BBOT config locations do not change this explicit Docker mount.
   Active inputs: ~/selflists/dns/biggest_dnslist.txt and
@@ -242,10 +229,10 @@ def config_help() -> str:
     Other result/DNS/PureDNS files: directly in the result directory.
     .osint/: checkpoints and isolated command workspaces.
   Commands require Bash/POSIX tools (macOS/Linux, or a matching WSL environment).
-  Templates are executable local input. Only use trusted templates.
+  Commands are bundled with this script; no Markdown files are required.
   Domain-list variants are used, including for a single root. PTR uses IPv4
   from dns_records.txt; standalone IP/nets.txt alternatives are not executed.
-  AXFR runs at its template position in active/all mode, without an opt-in flag.
+  AXFR runs at its agreed position in active/all mode, without an opt-in flag.
   --dry-run shows commands with API keys redacted; no files or tools are changed.
 '''
 
@@ -319,7 +306,7 @@ class Collector:
         state_path = self.path if self.path.exists() else legacy
         self.state = json.loads(state_path.read_text()) if state_path.exists() else {'schema': 1, 'jobs': {}}
         if self.state.get('schema') != 1:
-            raise ValueError('Unsupported template state schema')
+            raise ValueError('Unsupported collector state schema')
         self.jobs = self.state['jobs']
         self.current = {}
 
@@ -386,7 +373,7 @@ class Collector:
         phases = ['passive', 'active'] if self.args.mode == 'all' else [self.args.mode]
         for phase in phases:
             prepared = {root: self.prepare(root, phase) for root in self.roots}
-            # Source first, then roots: the action order is the template order.
+            # Source first, then roots: preserve the agreed action order.
             for index, step in enumerate(self.steps[phase]):
                 if phase == 'passive' and index == 1:
                     print('Manual (no commands in template): ' + ', '.join(MANUAL), flush=True)
@@ -399,17 +386,19 @@ class Collector:
                     print('  cwd: ' + str(self.output / job['workspace']), flush=True)
                     if self.args.dry_run:
                         continue
+                    if step.title == 'DNSDumpster' and not os.environ.get('DNSDUMPSTER_API_KEY', '').strip():
+                        raise RuntimeError('DNSDUMPSTER_API_KEY is not set; export your DNSDumpster API key before passive/all collection (see --help)')
                     missing = [name for name in step.tools if not shutil.which(name)]
                     if missing:
                         raise RuntimeError('Missing tools: ' + ', '.join(missing))
                     if step.title.startswith('BBOT '):
                         if not (Path.home() / '.config/bbot/secrets.yml').is_file():
-                            raise RuntimeError('Missing BBOT secrets.yml; see --help (template Docker mount requires a file)')
+                            raise RuntimeError('Missing BBOT secrets.yml; see --help (Docker mount requires a file)')
                         if not sys.stdin.isatty():
-                            raise RuntimeError('Template BBOT uses docker -it; run from an interactive terminal')
+                            raise RuntimeError('BBOT uses docker -it; run from an interactive terminal')
                     if step.title == 'PureDNS':
                         if not (Path.home() / 'selflists/dns/biggest_dnslist.txt').is_file():
-                            raise RuntimeError('Missing ~/selflists/dns/biggest_dnslist.txt from the template')
+                            raise RuntimeError('Missing ~/selflists/dns/biggest_dnslist.txt')
                         if not (self.output / job['workspace'] / 'resolvers.txt').is_file():
                             raise RuntimeError('Missing ~/selflists/dns/resolvers.txt')
                     job['status'] = 'running'
@@ -474,10 +463,9 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     result.add_argument('-i', '--input', required=True, type=Path, help='Root domains, one per line')
     result.add_argument('-o', '--output', type=Path, default=Path('.'), help='Result directory (default: current directory)')
-    result.add_argument('--mode', choices=('passive', 'active', 'all'), default='all', help='Template parts to run (default: all)')
-    result.add_argument('--refresh', action='store_true', help='Rerun selected template parts for all input roots')
+    result.add_argument('--mode', choices=('passive', 'active', 'all'), default='all', help='Collection stages to run (default: all)')
+    result.add_argument('--refresh', action='store_true', help='Rerun selected collection stages for all input roots')
     result.add_argument('--dry-run', action='store_true', help='Read-only command plan; API keys are redacted')
-    result.add_argument('--templates', type=Path, help='Folder containing the two trusted Actions.md files')
     return result
 
 
@@ -487,13 +475,10 @@ def main(argv=None) -> int:
     if '-h' in argv or '--help' in argv:
         cli.epilog = config_help()
     args = cli.parse_args(argv)
-    args.launch = Path.cwd()
-    candidates = [args.launch / 'Pentest Template/Osint', Path(__file__).resolve().parents[1] / 'Pentest Template/Osint']
-    templates = args.templates or next((path for path in candidates if (path / 'Passive Actions.md').is_file()), candidates[0])
     try:
         if os.name != 'posix':
-            raise ValueError('These exact Bash/Docker templates require a POSIX environment (e.g. WSL)')
-        steps = load_steps(templates)
+            raise ValueError('These Bash/Docker commands require a POSIX environment (e.g. WSL)')
+        steps = load_steps()
         roots = read_roots(args.input)
         with project_lock(args.output.resolve() / '.osint', args.dry_run):
             collector = Collector(args, roots, steps)
