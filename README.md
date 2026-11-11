@@ -212,27 +212,31 @@ own `top_domains.txt`; dependency groups preserve ordering between stages
 that consume one another's files. The collector creates the `subdomains/` directory and copies
 `~/selflists/dns/resolvers.txt` and `~/selflists/dns/resolvers-trusted.txt` into active
 workspaces under those same filenames. Changing either file invalidates the active
-cache. Other paths
-and tool options retain their agreed values.
+cache. The wordlist is also included in the active cache fingerprint. Other
+paths and tool options retain their agreed values.
 
-Collection uses the following dependency groups, with at most **two commands
+Collection uses a shared queue, with at most **four commands
 running globally across all input roots**, and at most **one BBOT** at a time:
 
-1. DNSDumpster, then crt.sh, remain sequential with their original pauses.
-   The manual Subdomainfinder/Pentest-tool/Nmapper/SuIP entries remain visible.
-2. Subfinder, Findomain, Assetfinder and passive BBOT share the two slots.
-   BBOT's copy runs only after that root's BBOT command succeeds.
-3. After passive collection finishes, active BBOT and PureDNS share the slots.
-   Each result copy waits for its own producer.
-4. Domain-list preparation waits for the entire active discovery group.
-5. DNS records and SRV discovery share the slots, using the prepared snapshot.
-6. Host extraction → PTR → DNS findings → AXFR preparation/run/collection →
-   final domains → IPv4 resolution → unique IPv4 remain sequential barriers.
+1. DNSDumpster, crt.sh, Subfinder, Findomain, Assetfinder and passive BBOT are
+   independent queue tasks. Each API command retains its own original pauses.
+   PureDNS is queued immediately alongside them in `--mode all`, without
+   waiting for passive collection. The manual entries remain visible.
+2. BBOT and PureDNS copies wait for their own producers. Once all passive
+   outputs for a root are complete, they are attached to its active workspace
+   and seeds are prepared. This does not move or interrupt a running PureDNS.
+3. Active BBOT can start for that root as soon as its passive snapshot and
+   seeds are ready, even while PureDNS or other roots' passive tasks still run.
+   The single-BBOT limit also applies across passive and active tasks.
+4. Domain-list preparation waits for the discovery queue to finish, including
+   both active BBOT and PureDNS. DNS records and SRV share the slots.
+5. Later DNS/PTR/AXFR groups, the two expansion rounds and final exports retain
+   their established dependency order.
 
 Each source/stage has at most one root running at once; roots share the global
 slots rather than multiplying the concurrency limit. Tool command lines,
 outputs and internal tool rate settings are unchanged. This can increase
-aggregate API traffic compared with the earlier sequential runner; the two-slot
+aggregate API traffic compared with the earlier sequential runner; the four-slot
 limit is on commands, not on the tools' internal threads/requests.
 
 The dashboard can show several `running` stages. Each command's output is routed
@@ -240,7 +244,7 @@ to its own task history, and Tab sends input only to the selected running task.
 Switching the viewed task does not move another command's stdin. On a failure,
 no new work is launched, already-running peers are stopped/reaped, and dependent
 groups do not start. Successful completed checkpoints are saved by the single
-coordinator, including independent steps after a failed step. Ctrl+C stops both
+coordinator, including independent steps after a failed step. Ctrl+C stops all
 slots and preserves completed work. Failed/interrupted commands restart from
 their beginning in a clean workspace on the next invocation.
 
@@ -321,6 +325,13 @@ keys, or to repeat collection. There is one writer per project. New checkpoints
 are in `.osint/template-state.json`; legacy `template-state.json` checkpoints
 are read if the new state file is absent. The earlier collector's `state.sqlite3` is not
 reused because its commands differed. Old data is not deleted.
+
+PureDNS has a separate input fingerprint for the root, command, wordlist and
+both resolver files. Its verified completed outputs survive a passive failure
+or changed passive results, while seeds and active BBOT use the new passive
+snapshot. `--refresh` reruns PureDNS too. This scheduler upgrade recollects
+previous active caches once to add the wordlist fingerprint; passive caches
+and provider command lines remain unchanged.
 
 `--dry-run` prints a read-only plan without running tools or creating/modifying
 project files. API keys are redacted in progress/plans; the actual command is

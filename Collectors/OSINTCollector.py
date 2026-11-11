@@ -54,6 +54,7 @@ MANUAL = ('Subdomainfinder', 'Pentest-tool', 'Nmapper', 'SuIP')
 STATE_FILE = '.osint/template-state.json'
 HISTORY_FILE = 'findings_history.json'
 DNS_ROUNDS = 2
+COLLECTION_WORKERS = 4
 RESOLVER_FILES = ('resolvers.txt', 'resolvers-trusted.txt')
 SEEDS_COMMAND = r'''for file in ./subdomains/subdomains_{dnsdumpster,crtsh,subfinder,findomain,assetfinder,bbot_passive}.txt; do if [ -f "$file" ]; then cat "$file"; fi; done | awk 'NR==FNR {root=tolower($1); sub(/\.$/,"",root); if(root!=""){roots[root]=1; print root}; next} {name=tolower($1); sub(/^\*\./,"",name); sub(/\.$/,"",name); if(name !~ /^[a-z0-9.-]+$/) next; for(root in roots) if(name==root || (length(name)>length(root) && substr(name,length(name)-length(root))=="."root)){print name; break}}' top_domains.txt - | sort -u > bbot_seeds.txt'''
 _execution = threading.local()
@@ -310,10 +311,13 @@ def config_help() -> str:
     Ctrl+C stops collection. sudo/system installers use their native terminal.
     Each task retains its latest 300 output lines; long output stays in its pane.
     On failure, task, command, cwd and recent output remain visible after exit.
-  Parallel collection: at most 2 commands across all roots, one BBOT at a time.
-    Passive group: Subfinder/Findomain/Assetfinder/BBOT. Active: BBOT/PureDNS.
-    DNS records/SRV run together. DNSDumpster/crt.sh and final stages stay serial.
-    Groups wait for dependencies; a failure stops peers and blocks later groups.
+  Parallel collection: at most 4 commands across all roots, one BBOT at a time.
+    DNSDumpster/crt.sh/Subfinder/Findomain/Assetfinder/passive BBOT share the queue.
+    PureDNS starts immediately alongside passive sources in all mode.
+    Active BBOT waits for that root's complete passive snapshot, not PureDNS.
+    Domain-list preparation waits for active BBOT and PureDNS; DNS/SRV run together.
+    Later DNS groups retain their order; failure stops peers and blocks later work.
+    Completed PureDNS is reusable after a passive failure or changed passive snapshot.
     Tab sends input only to the selected running task; logs stay separate.
   BBOT: -y skips its scan-start confirmation in both passive and active passes.
     Active BBOT uses -s bbot_seeds.txt (root + scoped passive findings).
@@ -1355,8 +1359,8 @@ def readiness(args, steps, report=print):
 
 def collection_groups(phase: str) -> tuple[tuple[int, ...], ...]:
     if phase == 'passive':
-        return ((0,), (1,), (2, 3, 4, 5, 6))
-    groups = [(0,), (1, 2, 3, 4), (5,), (6, 7), *((index,) for index in range(8, 14))]
+        return (tuple(range(7)),)
+    groups = [tuple(range(5)), (5,), (6, 7), *((index,) for index in range(8, 14))]
     for number in range(DNS_ROUNDS):
         start = 14 + number * 9
         groups.extend([(start,), (start + 1, start + 2),
@@ -1427,6 +1431,7 @@ class Collector:
         self.current = {}
         self.fresh = set()
         self.run_id = str(time.time_ns())
+        self.input_hashes = {}
         history_path = self.output / HISTORY_FILE
         self.history = json.loads(history_path.read_text()) if history_path.exists() else {'schema': 1, 'findings': {}}
         if self.history.get('schema') != 1 or not isinstance(self.history.get('findings'), dict):
@@ -1436,9 +1441,25 @@ class Collector:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         atomic_text(self.path, json.dumps(self.state, indent=2) + '\n')
 
-    def prepare(self, root, phase):
+    def definition(self, root, phase, inputs):
+        # -y changes only BBOT's start confirmation, preserving passive caches
+        # from versions before that flag was introduced.
+        commands = [step.command.removesuffix(' -y') if step.title.startswith('BBOT ') else step.command
+                    for step in self.steps[phase]]
+        return fingerprint([root, commands, inputs])
+
+    def input_hash(self, path):
+        if not path.is_file():
+            return None
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        if key not in self.input_hashes:
+            self.input_hashes[key] = file_hash(path)
+        return self.input_hashes[key]
+
+    def prepare(self, root, phase, defer_passive=False):
         seed = {}
-        if phase == 'active':
+        if phase == 'active' and not defer_passive:
             prior = self.current.get((root, 'passive')) or self.jobs.get(root + ':passive')
             if prior and prior.get('status') == 'done':
                 directory = self.output / prior['workspace']
@@ -1447,13 +1468,13 @@ class Collector:
                         seed[name] = directory / name
         inputs = {name: file_hash(path) for name, path in seed.items()}
         resolvers = {name: Path.home() / 'selflists/dns' / name for name in RESOLVER_FILES}
+        puredns_definition = None
         if phase == 'active':
-            inputs.update({name: file_hash(path) if path.is_file() else None for name, path in resolvers.items()})
-        # -y changes only BBOT's start confirmation. Reuse previous completed
-        # steps when upgrading from commands without this trailing flag.
-        commands = [step.command.removesuffix(' -y') if step.title.startswith('BBOT ') else step.command
-                    for step in self.steps[phase]]
-        definition = fingerprint([root, commands, inputs])
+            inputs.update({name: self.input_hash(path) for name, path in resolvers.items()})
+            inputs['wordlist'] = self.input_hash(Path.home() / 'selflists/dns/biggest_dnslist.txt')
+            puredns_definition = fingerprint([root, [self.steps[phase][i].command for i in (3, 4)],
+                                             {name: inputs[name] for name in (*RESOLVER_FILES, 'wordlist')}])
+        definition = self.definition(root, phase, inputs)
         key = root + ':' + phase
         old = self.jobs.get(key)
         if not self.args.refresh and old and old['definition'] == definition:
@@ -1465,7 +1486,7 @@ class Collector:
                 if checkpoint and all(dependency in valid for dependency in dependencies.get(index, ())) and all(
                         (directory / name).is_file() and file_hash(directory / name) == checkpoint.get(name) for name in step.outputs):
                     valid.add(index)
-            if len(valid) == len(self.steps[phase]):
+            if len(valid) == len(self.steps[phase]) and not defer_passive:
                 self.current[(root, phase)] = old
                 if old.get('status') != 'done':
                     old['status'] = 'done'
@@ -1477,8 +1498,23 @@ class Collector:
             # workspace so partial BBOT directories cannot masquerade as done.
         else:
             valid = set()
+        if phase == 'active':
+            if defer_passive:
+                valid.intersection_update((3, 4))
+            # PureDNS does not depend on passive snapshots. Reuse its verified
+            # work after a passive failure/refresh of unrelated input files.
+            if not self.args.refresh and old and old.get('puredns_definition') == puredns_definition:
+                directory = self.output / old['workspace']
+                for index in (3, 4):
+                    checkpoint = old.get('steps', {}).get(str(index))
+                    if (index == 3 or 3 in valid) and checkpoint and all(
+                            (directory / name).is_file() and file_hash(directory / name) == checkpoint.get(name)
+                            for name in self.steps[phase][index].outputs):
+                        valid.add(index)
         relative = f'.osint/runs/{root}/{phase}-{time.time_ns()}'
         job = {'definition': definition, 'workspace': relative, 'steps': {}, 'observed_at': {}, 'status': 'pending'}
+        if phase == 'active':
+            job.update(inputs=inputs, puredns_definition=puredns_definition, awaiting_passive=defer_passive)
         self.current[(root, phase)] = job
         if self.args.dry_run:
             return job, valid
@@ -1505,6 +1541,21 @@ class Collector:
         self.jobs[key] = job
         self.save()
         return job, valid
+
+    def bind_passive(self, root, job):
+        """Attach the final passive snapshot without moving a running PureDNS."""
+        if self.args.dry_run:
+            job['awaiting_passive'] = False
+            return
+        prior = self.current[(root, 'passive')]
+        source = self.output / prior['workspace']
+        destination = self.output / job['workspace']
+        for name in PASSIVE_FILES:
+            shutil.copyfile(source / name, destination / name)
+            job['inputs'][name] = file_hash(destination / name)
+        job['definition'] = self.definition(root, 'active', job['inputs'])
+        job['awaiting_passive'] = False
+        self.save()
 
     def preflight(self, step: Step, directory: Path):
         if step.title == 'DNSDumpster' and not os.environ.get('DNSDUMPSTER_API_KEY', '').strip():
@@ -1586,29 +1637,53 @@ class Collector:
             del _execution.cancellation
 
     def run_group(self, phase, indices, prepared, completed, stage_offset):
-        steps = self.steps[phase]
-        dependencies = step_dependencies(phase)
-        limit = 2 if len(indices) > 1 else 1
-        pending = [(root, index) for index in indices for root in self.roots if index not in completed[root]]
+        tasks = [(root, phase, index) for root in self.roots for index in indices]
+        self.run_tasks(tasks, {(root, phase): job for root, job in prepared.items()},
+                       {(root, phase): done for root, done in completed.items()},
+                       {phase: stage_offset}, COLLECTION_WORKERS if len(indices) > 1 else 1)
+
+    def run_tasks(self, tasks, prepared, completed, offsets, limit=COLLECTION_WORKERS):
+        pending = [task for task in tasks if task[2] not in completed[task[:2]]]
+        stages = sorted({(phase, index) for _, phase, index in tasks}, key=lambda stage: offsets[stage[0]] + stage[1])
         total = len(self.roots)
-        for index in indices:
-            count = sum(index in completed[root] for root in self.roots)
+        for phase, index in stages:
+            count = sum(index in completed[root, phase] for root in self.roots)
             if self.screen:
-                self.screen.finish(stage_offset + index, 'cached' if count == total else 'waiting', f'{count}/{total} roots completed')
+                self.screen.finish(offsets[phase] + index, 'cached' if count == total else 'waiting', f'{count}/{total} roots completed')
         if not pending:
-            for index in indices:
-                self.message(f'[{phase}] {steps[index].title}: all {total} roots cached', stage_offset + index)
+            for phase, index in stages:
+                self.message(f'[{phase}] {self.steps[phase][index].title}: all {total} roots cached', offsets[phase] + index)
             return
-        self.message(f'[{phase}] {"Parallel" if limit == 2 else "Sequential"} group (limit {limit}): ' + ', '.join(steps[i].title for i in indices), stage_offset + indices[0])
+        self.message(f'Collection queue (limit {limit}): ' + ', '.join(self.steps[phase][index].title for phase, index in stages), offsets[stages[0][0]] + stages[0][1])
+
+        def bind_ready():
+            for root in self.roots:
+                job = prepared.get((root, 'active'))
+                if job and job.get('awaiting_passive') and len(completed[root, 'passive']) == len(self.steps['passive']):
+                    self.bind_passive(root, job)
+
+        def eligible(task, busy=(), bbot_busy=False):
+            root, phase, index = task
+            job = prepared[root, phase]
+            return ((phase, index) not in busy
+                    and all(dependency in completed[root, phase] for dependency in step_dependencies(phase).get(index, ()))
+                    and not (phase == 'active' and index == 0 and job.get('awaiting_passive'))
+                    and not (bbot_busy and self.steps[phase][index].title.startswith('BBOT ')))
+
         if self.args.dry_run:
-            for root, index in pending:
-                job = prepared[root]
-                step = steps[index]
-                self.message(f'[{phase}] {root}: {step.title} [planned]\n  {safe_text(step.command)}\n  cwd: {self.output / job["workspace"]}', stage_offset + index)
-                completed[root].add(index)
-            for index in indices:
+            while pending:
+                bind_ready()
+                task = next((task for task in pending if eligible(task)), None)
+                if task is None:
+                    raise RuntimeError('No runnable tasks; collection dependency graph is inconsistent')
+                root, phase, index = task
+                job, step = prepared[root, phase], self.steps[phase][index]
+                self.message(f'[{phase}] {root}: {step.title} [planned]\n  {safe_text(step.command)}\n  cwd: {self.output / job["workspace"]}', offsets[phase] + index)
+                completed[root, phase].add(index)
+                pending.remove(task)
+            for phase, index in stages:
                 if self.screen:
-                    self.screen.finish(stage_offset + index, 'planned', f'{total}/{total} roots planned')
+                    self.screen.finish(offsets[phase] + index, 'planned', f'{total}/{total} roots planned')
             return
 
         cancellation = threading.Event()
@@ -1617,11 +1692,11 @@ class Collector:
         failure = None
         interrupted = None
 
-        def record(future, root, index):
+        def record(future, root, phase, index):
             nonlocal failure, interrupted
-            job = prepared[root]
-            step = steps[index]
-            ui_index = stage_offset + index
+            job = prepared[root, phase]
+            step = self.steps[phase][index]
+            ui_index = offsets[phase] + index
             try:
                 hashes = future.result()
             except CommandCancelled:
@@ -1645,9 +1720,9 @@ class Collector:
                 job['steps'][str(index)] = hashes
                 job.setdefault('observed_at', {})[str(index)] = utc_now()
                 self.fresh.add((root, phase, index))
-                completed[root].add(index)
-                job['status'] = 'done' if len(completed[root]) == len(steps) else 'running' if any(r == root for r, _ in active.values()) else 'pending'
-                count = sum(index in completed[r] for r in self.roots)
+                completed[root, phase].add(index)
+                job['status'] = 'done' if len(completed[root, phase]) == len(self.steps[phase]) else 'running' if any(r == root and p == phase for r, p, _ in active.values()) else 'pending'
+                count = sum(index in completed[r, phase] for r in self.roots)
                 if self.screen:
                     self.screen.finish(ui_index, 'done' if count == total else 'waiting', f'{count}/{total} roots completed')
                 self.message(f'[{phase}] {root}: {step.title} [done]', ui_index)
@@ -1658,26 +1733,24 @@ class Collector:
                 # Consume errors before launching more independent work.
                 finished = [future for future in active if future.done()]
                 for future in finished:
-                    root, index = active.pop(future)
-                    record(future, root, index)
+                    root, phase, index = active.pop(future)
+                    record(future, root, phase, index)
                 if failure or interrupted:
                     break
+                bind_ready()
                 while len(active) < limit:
-                    busy_indices = {index for _, index in active.values()}
-                    bbot_busy = any(steps[index].title.startswith('BBOT ') for _, index in active.values())
-                    candidate = next(((root, index) for root, index in pending
-                                      if index not in busy_indices
-                                      and all(dependency in completed[root] for dependency in dependencies.get(index, ()))
-                                      and not (bbot_busy and steps[index].title.startswith('BBOT '))), None)
+                    busy_indices = {(phase, index) for _, phase, index in active.values()}
+                    bbot_busy = any(self.steps[phase][index].title.startswith('BBOT ') for _, phase, index in active.values())
+                    candidate = next((task for task in pending if eligible(task, busy_indices, bbot_busy)), None)
                     if candidate is None:
                         break
-                    root, index = candidate
+                    root, phase, index = candidate
                     pending.remove(candidate)
-                    job, step = prepared[root], steps[index]
+                    job, step = prepared[root, phase], self.steps[phase][index]
                     directory = self.output / job['workspace']
-                    ui_index = stage_offset + index
+                    ui_index = offsets[phase] + index
                     if self.screen:
-                        self.screen.begin(ui_index, f'{root} | {sum(index in completed[r] for r in self.roots)}/{total} roots completed', step.command, str(directory))
+                        self.screen.begin(ui_index, f'{root} | {sum(index in completed[r, phase] for r in self.roots)}/{total} roots completed', step.command, str(directory))
                     self.message(f'[{phase}] {root}: {step.title} [run]\n  {safe_text(step.command)}\n  cwd: {directory}', ui_index)
                     try:
                         self.preflight(step, directory)
@@ -1688,7 +1761,7 @@ class Collector:
                     job['status'] = 'running'
                     self.save()
                     future = executor.submit(self.execute_step, step, directory, ui_index, cancellation)
-                    active[future] = (root, index)
+                    active[future] = (root, phase, index)
                 if active:
                     wait(active, timeout=0.05, return_when=FIRST_COMPLETED)
                 elif pending:
@@ -1701,9 +1774,9 @@ class Collector:
                 cancellation.set()
             # Never leave another tool running after Ctrl+C or a peer failure.
             executor.shutdown(wait=True, cancel_futures=True)
-            for future, (root, index) in list(active.items()):
+            for future, (root, phase, index) in list(active.items()):
                 if not future.cancelled():
-                    record(future, root, index)
+                    record(future, root, phase, index)
         if interrupted:
             raise interrupted
         if failure:
@@ -1711,16 +1784,29 @@ class Collector:
 
     def run(self):
         phases = ['passive', 'active'] if self.args.mode == 'all' else [self.args.mode]
+        prepared, completed, offsets = {}, {}, {}
         stage_offset = 0
         for phase in phases:
-            prepared, completed = {}, {}
+            offsets[phase] = stage_offset
             for root in self.roots:
-                prepared[root], completed[root] = self.prepare(root, phase)
-            for indices in collection_groups(phase):
-                if phase == 'passive' and indices[0] == 2:
-                    self.message('Manual (no commands supplied): ' + ', '.join(MANUAL), stage_offset + 2)
-                self.run_group(phase, indices, prepared, completed, stage_offset)
+                deferred = phase == 'active' and 'passive' in phases and len(completed[root, 'passive']) != len(self.steps['passive'])
+                prepared[root, phase], completed[root, phase] = self.prepare(root, phase, deferred)
             stage_offset += len(self.steps[phase])
+        tasks = []
+        for root in self.roots:
+            if 'active' in phases:
+                tasks.extend((root, 'active', index) for index in (3, 4))
+            if 'passive' in phases:
+                tasks.extend((root, 'passive', index) for index in range(len(self.steps['passive'])))
+            if 'active' in phases:
+                tasks.extend((root, 'active', index) for index in (0, 1, 2))
+        if 'passive' in phases:
+            self.message('Manual (no commands supplied): ' + ', '.join(MANUAL), offsets['passive'] + 2)
+        self.run_tasks(tasks, prepared, completed, offsets)
+        if 'active' in phases:
+            for indices in collection_groups('active')[1:]:
+                self.run_group('active', indices, {root: prepared[root, 'active'] for root in self.roots},
+                               {root: completed[root, 'active'] for root in self.roots}, offsets['active'])
         if not self.args.dry_run:
             self.export()
 
