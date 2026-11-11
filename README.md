@@ -210,7 +210,9 @@ directory. The default is `--mode all`: passive collection first, then active co
 are used even for a single domain. Each root gets an isolated workspace with its
 own `top_domains.txt`; dependency groups preserve ordering between stages
 that consume one another's files. The collector creates the `subdomains/` directory and copies
-`~/selflists/dns/resolvers.txt` into active workspaces as `resolvers.txt`. Other paths
+`~/selflists/dns/resolvers.txt` and `~/selflists/dns/resolvers-trusted.txt` into active
+workspaces under those same filenames. Changing either file invalidates the active
+cache. Other paths
 and tool options retain their agreed values.
 
 Collection uses the following dependency groups, with at most **two commands
@@ -278,8 +280,14 @@ Docker, `puredns`/`massdns`, `dig`, `dnsx`, `host` and the shell text tools.
   also has `bbot.yml`, the command does **not** mount it; its host settings do
   not reach this container. The collector never adds another mount or changes
   the explicit path based on OS conventions.
-- Active collection uses `~/selflists/dns/biggest_dnslist.txt` and
-  `~/selflists/dns/resolvers.txt`. The help lists these required paths too.
+- Active collection requires `~/selflists/dns/biggest_dnslist.txt`,
+  `~/selflists/dns/resolvers.txt` for bulk queries, and a separate small list in
+  `~/selflists/dns/resolvers-trusted.txt` for trusted checks. Put one DNS server
+  address per line in each resolver file. PureDNS receives an explicit
+  `--resolvers-trusted resolvers-trusted.txt`; the collector checks both files
+  before collection and copies them into each active workspace. These input
+  files are maintained locally and are not created or overwritten by collection.
+  The help lists all required paths.
 
 Before any collection command, a common readiness check reports all detected
 problems together: selected binaries and required options, Docker access,

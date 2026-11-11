@@ -54,6 +54,7 @@ MANUAL = ('Subdomainfinder', 'Pentest-tool', 'Nmapper', 'SuIP')
 STATE_FILE = '.osint/template-state.json'
 HISTORY_FILE = 'findings_history.json'
 DNS_ROUNDS = 2
+RESOLVER_FILES = ('resolvers.txt', 'resolvers-trusted.txt')
 SEEDS_COMMAND = r'''for file in ./subdomains/subdomains_{dnsdumpster,crtsh,subfinder,findomain,assetfinder,bbot_passive}.txt; do if [ -f "$file" ]; then cat "$file"; fi; done | awk 'NR==FNR {root=tolower($1); sub(/\.$/,"",root); if(root!=""){roots[root]=1; print root}; next} {name=tolower($1); sub(/^\*\./,"",name); sub(/\.$/,"",name); if(name !~ /^[a-z0-9.-]+$/) next; for(root in roots) if(name==root || (length(name)>length(root) && substr(name,length(name)-length(root))=="."root)){print name; break}}' top_domains.txt - | sort -u > bbot_seeds.txt'''
 _execution = threading.local()
 
@@ -148,7 +149,7 @@ def load_steps() -> dict[str, list[Step]]:
                  'cp ./bbot_active/subdomains.txt ./subdomains/subdomains_bbot_active.txt',
                  ('subdomains/subdomains_bbot_active.txt',), ('cp',)),
             Step('PureDNS',
-                 'puredns bruteforce ~/selflists/dns/biggest_dnslist.txt -d top_domains.txt -r resolvers.txt -w puredns_subdomains.txt --write-massdns puredns_massdns.txt --write-wildcards puredns_wildcards.txt',
+                 'puredns bruteforce ~/selflists/dns/biggest_dnslist.txt -d top_domains.txt -r resolvers.txt --resolvers-trusted resolvers-trusted.txt -w puredns_subdomains.txt --write-massdns puredns_massdns.txt --write-wildcards puredns_wildcards.txt',
                  ('puredns_subdomains.txt', 'puredns_massdns.txt', 'puredns_wildcards.txt'), ('puredns', 'massdns')),
             Step('Copy PureDNS',
                  'cp puredns_subdomains.txt ./subdomains/subdomains_puredns.txt',
@@ -282,9 +283,12 @@ def config_help() -> str:
     bbot.yml is NOT mounted by the command, so host settings from it do not
     reach Docker. No mounts or command flags are added by the collector.
     Native BBOT config locations do not change this explicit Docker mount.
-  Active inputs: ~/selflists/dns/biggest_dnslist.txt and
-    ~/selflists/dns/resolvers.txt.
-    The resolvers file is copied into each workspace as resolvers.txt.
+  Active inputs: ~/selflists/dns/biggest_dnslist.txt,
+    ~/selflists/dns/resolvers.txt (public, bulk queries), and
+    ~/selflists/dns/resolvers-trusted.txt (small trusted list, one server per line).
+    Both resolver files are copied into each workspace under their own names.
+    PureDNS explicitly uses --resolvers-trusted; no implicit trusted list fallback.
+    Changing either resolver file invalidates the active cache.
   Results default to the launch directory; -o selects another directory.
     subdomains/: per-source domain lists, including a copy of PureDNS findings.
     bbot_active/<root>/ and bbot_passive/<root>/: BBOT reports.
@@ -1258,7 +1262,7 @@ def readiness(args, steps, report=print):
         if not sys.stdin.isatty():
             errors.append('BBOT uses docker -it; run from an interactive terminal')
     if 'active' in phases:
-        for name in ('biggest_dnslist.txt', 'resolvers.txt'):
+        for name in ('biggest_dnslist.txt', *RESOLVER_FILES):
             readable(Path.home() / 'selflists/dns' / name, 'Active input')
 
     # Probe actual write access, including existing export directories. Never
@@ -1307,7 +1311,7 @@ def readiness(args, steps, report=print):
         ('bash', ['--version'], ()), ('curl', ['--version'], ()), ('jq', ['--version'], ()),
         ('findomain', ['--help'], ('-f', '-u')),
         ('assetfinder', ['--help'], ('--subs-only',)),
-        ('puredns', ['bruteforce', '--help'], ('-d', '-r', '-w', '--write-massdns', '--write-wildcards')),
+        ('puredns', ['bruteforce', '--help'], ('-d', '-r', '--resolvers-trusted', '-w', '--write-massdns', '--write-wildcards')),
         ('massdns', ['--help'], ()), ('dig', ['-v'], ()),
         ('dnsx', ['-h'], ('-ptr', '-resp-only', '-silent', '-rl')),
     ):
@@ -1442,9 +1446,9 @@ class Collector:
                     if (directory / name).is_file():
                         seed[name] = directory / name
         inputs = {name: file_hash(path) for name, path in seed.items()}
-        resolver = Path.home() / 'selflists/dns/resolvers.txt'
+        resolvers = {name: Path.home() / 'selflists/dns' / name for name in RESOLVER_FILES}
         if phase == 'active':
-            inputs['resolvers.txt'] = file_hash(resolver) if resolver.is_file() else None
+            inputs.update({name: file_hash(path) if path.is_file() else None for name, path in resolvers.items()})
         # -y changes only BBOT's start confirmation. Reuse previous completed
         # steps when upgrading from commands without this trailing flag.
         commands = [step.command.removesuffix(' -y') if step.title.startswith('BBOT ') else step.command
@@ -1483,8 +1487,10 @@ class Collector:
         (directory / 'top_domains.txt').write_text(root + '\n', encoding='utf-8')
         for name, source in seed.items():
             shutil.copyfile(source, directory / name)
-        if phase == 'active' and resolver.is_file():
-            shutil.copyfile(resolver, directory / 'resolvers.txt')
+        if phase == 'active':
+            for name, path in resolvers.items():
+                if path.is_file():
+                    shutil.copyfile(path, directory / name)
         if valid:
             for index in sorted(valid):
                 step = self.steps[phase][index]
@@ -1514,8 +1520,9 @@ class Collector:
         if step.title == 'PureDNS':
             if not (Path.home() / 'selflists/dns/biggest_dnslist.txt').is_file():
                 raise RuntimeError('Missing ~/selflists/dns/biggest_dnslist.txt')
-            if not (directory / 'resolvers.txt').is_file():
-                raise RuntimeError('Missing ~/selflists/dns/resolvers.txt')
+            for name in RESOLVER_FILES:
+                if not (directory / name).is_file():
+                    raise RuntimeError(f'Missing ~/selflists/dns/{name}')
 
     def execute_step(self, step: Step, directory: Path, index: int, cancellation):
         # Workers only execute/hash independent files. The coordinator alone

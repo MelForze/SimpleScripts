@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 PROJECT_NAME = "simplescripts"
-VERSION = "1.0.22"
+VERSION = "1.0.23"
 SUMMARY = "Collection of offensive-security and utility scripts from the SimpleScripts repository."
 REQUIRES_PYTHON = ">=3.10"
 LICENSE = "MIT"
