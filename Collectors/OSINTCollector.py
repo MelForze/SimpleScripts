@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run the agreed subdomain/DNS collection commands in order."""
+"""Run the agreed subdomain/DNS commands in bounded dependency groups."""
 from __future__ import annotations
 
 import argparse
 import codecs
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
@@ -50,6 +51,11 @@ PASSIVE_FILES = (
 )
 MANUAL = ('Subdomainfinder', 'Pentest-tool', 'Nmapper', 'SuIP')
 STATE_FILE = '.osint/template-state.json'
+_execution = threading.local()
+
+
+class CommandCancelled(RuntimeError):
+    pass
 
 
 def fingerprint(value) -> str:
@@ -259,6 +265,11 @@ def config_help() -> str:
     Ctrl+C stops collection. sudo/system installers use their native terminal.
     Each task retains its latest 300 output lines; long output stays in its pane.
     On failure, task, command, cwd and recent output remain visible after exit.
+  Parallel collection: at most 2 commands across all roots, one BBOT at a time.
+    Passive group: Subfinder/Findomain/Assetfinder/BBOT. Active: BBOT/PureDNS.
+    DNS records/SRV run together. DNSDumpster/crt.sh and final stages stay serial.
+    Groups wait for dependencies; a failure stops peers and blocks later groups.
+    Tab sends input only to the selected running task; logs stay separate.
   BBOT: -y skips its scan-start confirmation in both passive and active passes.
   Commands require Bash/POSIX tools (macOS/Linux, or a matching WSL environment).
   Commands are bundled with this script; no Markdown files are required.
@@ -313,8 +324,10 @@ class TaskScreen:
         self.lock = threading.RLock()
         self._input_fd = self._original_tty = self._keyboard = None
         self._stop_keyboard = threading.Event()
-        self._child_input = None
-        self._pending_input = bytearray()
+        self._child_inputs = {}
+        self._pending_inputs = {}
+        self.input_task = None
+        self.failure_index = None
         self._keys = b''
         self.live = None
         self.enabled = False
@@ -339,6 +352,20 @@ class TaskScreen:
         self.Layout, self.Live, self.Panel, self.Table, self.Text = Layout, Live, Panel, Table, Text
         self.console = Console()
         self.enabled = True
+
+    @property
+    def _child_input(self):
+        return self._child_inputs.get(self.current)
+
+    def bind(self, index: int):
+        return TaskStream(self, index)
+
+    def fail(self, index: int, detail: str):
+        with self.lock:
+            self.states[index] = 'failed'
+            self.details[index] = detail
+            if self.failure_index is None:
+                self.failure_index = index
 
     @property
     def lines(self):
@@ -373,8 +400,11 @@ class TaskScreen:
         self._stop_input()
         if self.live:
             if kind:
-                self.states[self.current] = 'interrupted' if issubclass(kind, KeyboardInterrupt) else 'failed'
-                self.feed(str(value or 'Interrupted') + '\n')
+                index = self.failure_index if self.failure_index is not None else self.current
+                self.current = index
+                if self.failure_index is None:
+                    self.states[index] = 'interrupted' if issubclass(kind, KeyboardInterrupt) else 'failed'
+                self.feed(str(value or 'Interrupted') + '\n', index)
             self.live.refresh()
             self.live.stop()
             completed = sum(state in ('done', 'cached', 'installed', 'present') for state in self.states)
@@ -398,9 +428,9 @@ class TaskScreen:
             for line in lines[-20:]:
                 print(self.Text.from_ansi(safe_text(line)).plain, file=sys.stderr)
 
-    def log(self, message: str):
+    def log(self, message: str, index: int | None = None):
         if self.enabled:
-            self.feed(message + '\n')
+            self.feed(message + '\n', index)
         else:
             print(message, flush=True)
 
@@ -412,10 +442,12 @@ class TaskScreen:
                     log.lines.append(log.partial)
                     log.partial = ''
                 log.lines.append('── ' + detail + ' ──')
-            self.current = index
+                log.ansi, log.escape, log.carriage = '', '', False
+            if not self.input_mode:
+                self.current = index
             log.command, log.cwd = safe_text(command), cwd
             self.states[index], self.details[index] = 'running', detail
-            if self.follow:
+            if self.follow and not self.input_mode:
                 self.selected = index
                 log.offset = 0
 
@@ -424,12 +456,16 @@ class TaskScreen:
             self.states[index] = state
             if detail:
                 self.details[index] = detail
+            if self.follow and not self.input_mode and self.selected == index and state != 'running':
+                running = [i for i, value in enumerate(self.states) if value == 'running']
+                if running:
+                    self.current = self.selected = running[0]
 
-    def feed(self, text: str):
+    def feed(self, text: str, index: int | None = None):
         # Child terminal controls never reach the outer terminal. Keep only SGR
         # colors; strip cursor movement, title/clipboard strings and other C0s.
         with self.lock:
-            log = self.outputs[self.current]
+            log = self.outputs[self.current if index is None else index]
             for char in text:
                 if log.ansi == 'escape':
                     log.escape = ''
@@ -437,7 +473,7 @@ class TaskScreen:
                 elif log.ansi == 'csi':
                     if '@' <= char <= '~':
                         if char == 'm' and re.fullmatch(r'[0-9;:]*', log.escape):
-                            log.partial += '\x1b[' + log.escape + 'm'
+                            log.partial = (log.partial + '\x1b[' + log.escape + 'm')[-16384:]
                         log.ansi = log.escape = ''
                     elif len(log.escape) < 128:
                         log.escape += char
@@ -502,6 +538,7 @@ class TaskScreen:
             self._input_fd = self._original_tty = self._keyboard = None
             with self.lock:
                 self.input_mode = False
+                self.input_task = None
 
     def _read_keys(self):
         while not self._stop_keyboard.is_set():
@@ -531,14 +568,20 @@ class TaskScreen:
                 log.offset = max(0, log.offset - self.page_size)
                 self.follow = False
             elif key == 'follow':
+                running = [i for i, state in enumerate(self.states) if state == 'running']
+                self.current = self.current if self.current in running else self.selected if self.selected in running else running[0] if running else self.current
                 self.follow = True
                 self.selected = self.current
                 self.outputs[self.selected].offset = 0
             elif key == 'tab':
-                self.input_mode = not self.input_mode if self._child_input is not None else False
                 if self.input_mode:
+                    self.input_mode = False
+                    self.input_task = None
+                elif self.selected in self._child_inputs:
+                    self.input_mode = True
+                    self.input_task = self.selected
+                    self.current = self.selected
                     self.follow = True
-                    self.selected = self.current
                     self.outputs[self.selected].offset = 0
 
     def consume_keys(self, data: bytes):
@@ -549,9 +592,10 @@ class TaskScreen:
             while self._keys:
                 if self.input_mode:
                     before, tab, after = self._keys.partition(b'\t')
-                    if self._child_input is not None:
-                        room = max(0, 65536 - len(self._pending_input))
-                        self._pending_input.extend(before[:room])
+                    if self.input_task in self._child_inputs:
+                        pending = self._pending_inputs[self.input_task]
+                        room = max(0, 65536 - len(pending))
+                        pending.extend(before[:room])
                     self._keys = after if tab else b''
                     if tab:
                         self.handle_key('tab')
@@ -569,34 +613,39 @@ class TaskScreen:
                     elif key == b'\t':
                         self.handle_key('tab')
 
-    def attach_input(self, fd: int):
+    def attach_input(self, fd: int, index: int | None = None):
         with self.lock:
-            self._child_input = fd
-            self._pending_input.clear()
-            self.input_mode = False
+            index = self.current if index is None else index
+            self._child_inputs[index] = fd
+            self._pending_inputs[index] = bytearray()
 
     def detach_input(self, fd: int):
         with self.lock:
-            if self._child_input == fd:
-                self._child_input = None
-                self._pending_input.clear()
-                self.input_mode = False
+            index = next((i for i, value in self._child_inputs.items() if value == fd), None)
+            if index is not None:
+                self._child_inputs.pop(index)
+                self._pending_inputs.pop(index, None)
+                if self.input_task == index:
+                    self.input_mode = False
+                    self.input_task = None
 
-    def input_pending(self) -> bool:
+    def input_pending(self, index: int | None = None) -> bool:
         with self.lock:
-            return bool(self._pending_input)
+            return bool(self._pending_inputs.get(self.current if index is None else index))
 
     def flush_input(self, fd: int):
         with self.lock:
-            if self._child_input != fd or not self._pending_input:
+            index = next((i for i, value in self._child_inputs.items() if value == fd), None)
+            pending = self._pending_inputs.get(index)
+            if not pending:
                 return
             try:
-                count = os.write(fd, self._pending_input)
-                del self._pending_input[:count]
+                count = os.write(fd, pending)
+                del pending[:count]
             except BlockingIOError:
                 pass
             except OSError:
-                self._pending_input.clear()
+                pending.clear()
 
     @contextmanager
     def native_terminal(self):
@@ -647,7 +696,8 @@ class TaskScreen:
         root.split_column(self.Layout(name='header', size=3), self.Layout(name='body', size=body_height), self.Layout(name='footer', size=1))
         elapsed = int(time.monotonic() - self.started)
         mode = 'TOOL INPUT' if input_mode else 'follow' if following else 'history'
-        root['header'].update(self.Panel(self.Text(f'{self.title} | {elapsed // 60:02d}:{elapsed % 60:02d} | {mode}', style='bold cyan')))
+        running_count = states.count('running')
+        root['header'].update(self.Panel(self.Text(f'{self.title} | {elapsed // 60:02d}:{elapsed % 60:02d} | {running_count} running | {mode}', style='bold cyan')))
         root['body'].split_row(self.Layout(name='tasks', size=left_width), self.Layout(name='terminal'))
         table = self.Table.grid(padding=(0, 1), expand=True)
         table.add_column(width=2)
@@ -659,13 +709,31 @@ class TaskScreen:
                   'cached': 'blue', 'failed': 'red', 'interrupted': 'yellow', 'planned': 'yellow'}
         for i in range(start, min(len(self.labels), start + visible)):
             style = colors.get(states[i], 'dim')
-            marker = ('>' if i == selected else ' ') + ('*' if i == current and states[i] == 'running' else ' ')
+            marker = ('>' if i == selected else ' ') + ('*' if states[i] == 'running' else ' ')
             table.add_row(self.Text(marker, style='cyan'), self.Text(self.labels[i].split(': ', 1)[-1], style=style, overflow='ellipsis', no_wrap=True), self.Text(states[i], style=style))
         root['tasks'].update(self.Panel(table, title='Tasks'))
-        root['terminal'].update(self.Panel(body, title='Live terminal' if selected == current and not offset else 'Task history'))
+        root['terminal'].update(self.Panel(body, title='Live terminal' if states[selected] == 'running' and not offset else 'Task history'))
         hint = 'TOOL INPUT | Tab: tasks | Ctrl+C: stop' if input_mode else '↑/↓: tasks | PgUp/PgDn: scroll | f: follow | Tab: tool input | Ctrl+C: stop'
         root['footer'].update(self.Text(hint, style='dim', no_wrap=True, overflow='ellipsis'))
         return root
+
+
+class TaskStream:
+    """Route one concurrent command's output and input to its task only."""
+    def __init__(self, parent: TaskScreen, index: int):
+        self.parent, self.index = parent, index
+
+    def __getattr__(self, name):
+        return getattr(self.parent, name)
+
+    def feed(self, text):
+        self.parent.feed(text, self.index)
+
+    def attach_input(self, fd):
+        self.parent.attach_input(fd, self.index)
+
+    def input_pending(self):
+        return self.parent.input_pending(self.index)
 
 
 def safe_text(text: str) -> str:
@@ -695,7 +763,11 @@ def run_process(argv: list[str], workspace: Path, screen: TaskScreen | None = No
         nonlocal interrupted
         interrupted = True
 
-    previous = signal.signal(signal.SIGINT, defer_interrupt)
+    cancellation = getattr(_execution, 'cancellation', None)
+    if cancellation and cancellation.is_set():
+        raise CommandCancelled('Command cancelled before launch')
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGINT, defer_interrupt) if on_main_thread else None
     try:
         if use_pty:
             master, slave = os.openpty()
@@ -712,7 +784,8 @@ def run_process(argv: list[str], workspace: Path, screen: TaskScreen | None = No
     finally:
         if slave is not None:
             os.close(slave)
-        signal.signal(signal.SIGINT, previous)
+        if on_main_thread:
+            signal.signal(signal.SIGINT, previous)
     try:
         if use_pty:
             screen.attach_input(master)
@@ -723,6 +796,8 @@ def run_process(argv: list[str], workspace: Path, screen: TaskScreen | None = No
             fd = master if use_pty else child.stdout.fileno()
             last_size = os.get_terminal_size(screen._input_fd) if use_pty else None
             while True:
+                if cancellation and cancellation.is_set() and child.poll() is None:
+                    raise CommandCancelled('Command stopped after cancellation or another task failed')
                 writes = [master] if use_pty and screen.input_pending() else []
                 ready, writable, _ = select.select([fd], writes, [], 0.05)
                 if writable:
@@ -751,9 +826,13 @@ def run_process(argv: list[str], workspace: Path, screen: TaskScreen | None = No
                 if child.poll() is not None and not ready:
                     break
             screen.feed(decoder.decode(b'', final=True))
+        if cancellation and not capture:
+            while child.poll() is None:
+                if cancellation.wait(0.05) and child.poll() is None:
+                    raise CommandCancelled('Command stopped after cancellation or another task failed')
         code = child.wait()
     except BaseException as error:
-        signals = [(signal.SIGINT, 10), (signal.SIGTERM, 5), (signal.SIGKILL, 5)] if isinstance(error, KeyboardInterrupt) else [(signal.SIGTERM, 3), (signal.SIGKILL, 3)]
+        signals = [(signal.SIGINT, 10), (signal.SIGTERM, 5), (signal.SIGKILL, 5)] if isinstance(error, (KeyboardInterrupt, CommandCancelled)) else [(signal.SIGTERM, 3), (signal.SIGKILL, 3)]
         for sig, seconds in signals:
             try:
                 if own_session:
@@ -1102,6 +1181,20 @@ def install_tools(mode: str, dry_run: bool, ui_mode: str) -> int:
     return 0
 
 
+def collection_groups(phase: str) -> tuple[tuple[int, ...], ...]:
+    if phase == 'passive':
+        return ((0,), (1,), (2, 3, 4, 5, 6))
+    return ((0, 1, 2, 3), (4,), (5, 6), *((index,) for index in range(7, 16)))
+
+
+def step_dependencies(phase: str) -> dict[int, tuple[int, ...]]:
+    if phase == 'passive':
+        return {6: (5,)}
+    return {1: (0,), 3: (2,), 4: (1, 3), 5: (4,), 6: (4,), 7: (5, 6),
+            8: (5,), 9: (7, 8), 10: (5,), 11: (10,), 12: (11,),
+            13: (1, 3, 9, 12), 14: (13,), 15: (14,)}
+
+
 class Collector:
     def __init__(self, args, roots: list[str], steps: dict[str, list[Step]], screen: TaskScreen | None = None):
         self.args, self.roots, self.steps = args, roots, steps
@@ -1142,20 +1235,25 @@ class Collector:
         old = self.jobs.get(key)
         if not self.args.refresh and old and old['definition'] == definition:
             directory = self.output / old['workspace']
-            valid = 0
+            valid = set()
+            dependencies = step_dependencies(phase)
             for index, step in enumerate(self.steps[phase]):
                 checkpoint = old.get('steps', {}).get(str(index))
-                if not checkpoint or any(not (directory / name).is_file() or
-                       file_hash(directory / name) != checkpoint.get(name) for name in step.outputs):
-                    break
-                valid += 1
-            if valid == len(self.steps[phase]):
+                if checkpoint and all(dependency in valid for dependency in dependencies.get(index, ())) and all(
+                        (directory / name).is_file() and file_hash(directory / name) == checkpoint.get(name) for name in step.outputs):
+                    valid.add(index)
+            if len(valid) == len(self.steps[phase]):
                 self.current[(root, phase)] = old
+                if old.get('status') != 'done':
+                    old['status'] = 'done'
+                    if not self.args.dry_run:
+                        self.save()
                 return old, valid
-            # Retry in a clean workspace. BBOT may otherwise reuse/rename an old
-            # scan directory. Copy only the verified prefix's outputs.
+            # Keep every verified independent checkpoint, including steps that
+            # finished after a gap in another concurrent task. Retry in a fresh
+            # workspace so partial BBOT directories cannot masquerade as done.
         else:
-            valid = 0
+            valid = set()
         relative = f'.osint/runs/{root}/{phase}-{time.time_ns()}'
         job = {'definition': definition, 'workspace': relative, 'steps': {}, 'status': 'pending'}
         self.current[(root, phase)] = job
@@ -1169,7 +1267,8 @@ class Collector:
         if phase == 'active' and resolver.is_file():
             shutil.copyfile(resolver, directory / 'resolvers.txt')
         if valid:
-            for index, step in enumerate(self.steps[phase][:valid]):
+            for index in sorted(valid):
+                step = self.steps[phase][index]
                 for name in step.outputs:
                     destination = directory / name
                     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1179,70 +1278,182 @@ class Collector:
         self.save()
         return job, valid
 
+    def preflight(self, step: Step, directory: Path):
+        if step.title == 'DNSDumpster' and not os.environ.get('DNSDUMPSTER_API_KEY', '').strip():
+            raise RuntimeError('DNSDUMPSTER_API_KEY is not set; export your DNSDumpster API key before passive/all collection (see --help)')
+        missing = [name for name in step.tools if not shutil.which(name)]
+        if missing:
+            raise RuntimeError('Missing tools: ' + ', '.join(missing))
+        if step.title.startswith('BBOT '):
+            if not (Path.home() / '.config/bbot/secrets.yml').is_file():
+                raise RuntimeError('Missing BBOT secrets.yml; see --help (Docker mount requires a file)')
+            if not sys.stdin.isatty():
+                raise RuntimeError('BBOT uses docker -it; run from an interactive terminal')
+        if step.title == 'PureDNS':
+            if not (Path.home() / 'selflists/dns/biggest_dnslist.txt').is_file():
+                raise RuntimeError('Missing ~/selflists/dns/biggest_dnslist.txt')
+            if not (directory / 'resolvers.txt').is_file():
+                raise RuntimeError('Missing ~/selflists/dns/resolvers.txt')
+
+    def execute_step(self, step: Step, directory: Path, index: int, cancellation):
+        # Workers only execute/hash independent files. The coordinator alone
+        # owns checkpoint mutation, saving and dependency transitions.
+        _execution.cancellation = cancellation
+        try:
+            if self.screen and self.screen.enabled:
+                run_command(step.command, directory, self.screen.bind(index))
+            else:
+                run_command(step.command, directory)
+            missing = [name for name in step.outputs if not (directory / name).is_file()]
+            if missing:
+                raise RuntimeError('Expected output files are missing: ' + ', '.join(missing))
+            return {name: file_hash(directory / name) for name in step.outputs}
+        finally:
+            del _execution.cancellation
+
+    def run_group(self, phase, indices, prepared, completed, stage_offset):
+        steps = self.steps[phase]
+        dependencies = step_dependencies(phase)
+        limit = 2 if len(indices) > 1 else 1
+        pending = [(root, index) for index in indices for root in self.roots if index not in completed[root]]
+        total = len(self.roots)
+        for index in indices:
+            count = sum(index in completed[root] for root in self.roots)
+            if self.screen:
+                self.screen.finish(stage_offset + index, 'cached' if count == total else 'waiting', f'{count}/{total} roots completed')
+        if not pending:
+            for index in indices:
+                self.message(f'[{phase}] {steps[index].title}: all {total} roots cached', stage_offset + index)
+            return
+        self.message(f'[{phase}] {"Parallel" if limit == 2 else "Sequential"} group (limit {limit}): ' + ', '.join(steps[i].title for i in indices), stage_offset + indices[0])
+        if self.args.dry_run:
+            for root, index in pending:
+                job = prepared[root]
+                step = steps[index]
+                self.message(f'[{phase}] {root}: {step.title} [planned]\n  {safe_text(step.command)}\n  cwd: {self.output / job["workspace"]}', stage_offset + index)
+                completed[root].add(index)
+            for index in indices:
+                if self.screen:
+                    self.screen.finish(stage_offset + index, 'planned', f'{total}/{total} roots planned')
+            return
+
+        cancellation = threading.Event()
+        executor = ThreadPoolExecutor(max_workers=limit, thread_name_prefix='osint-command')
+        active = {}
+        failure = None
+        interrupted = None
+
+        def record(future, root, index):
+            nonlocal failure, interrupted
+            job = prepared[root]
+            step = steps[index]
+            ui_index = stage_offset + index
+            try:
+                hashes = future.result()
+            except CommandCancelled:
+                if self.screen:
+                    self.screen.finish(ui_index, 'interrupted', f'{root}: stopped')
+                job['status'] = 'interrupted'
+            except KeyboardInterrupt as error:
+                interrupted = error
+                cancellation.set()
+                if self.screen:
+                    self.screen.finish(ui_index, 'interrupted', root)
+                job['status'] = 'interrupted'
+            except BaseException as error:
+                cancellation.set()
+                if failure is None:
+                    failure = RuntimeError(f'{phase}/{step.title}/{root}: {error}')
+                job['status'] = 'failed'
+                if self.screen:
+                    self.screen.fail(ui_index, f'{root}: {error}')
+            else:
+                job['steps'][str(index)] = hashes
+                completed[root].add(index)
+                job['status'] = 'done' if len(completed[root]) == len(steps) else 'running' if any(r == root for r, _ in active.values()) else 'pending'
+                count = sum(index in completed[r] for r in self.roots)
+                if self.screen:
+                    self.screen.finish(ui_index, 'done' if count == total else 'waiting', f'{count}/{total} roots completed')
+                self.message(f'[{phase}] {root}: {step.title} [done]', ui_index)
+            self.save()
+
+        try:
+            while pending or active:
+                # Consume errors before launching more independent work.
+                finished = [future for future in active if future.done()]
+                for future in finished:
+                    root, index = active.pop(future)
+                    record(future, root, index)
+                if failure or interrupted:
+                    break
+                while len(active) < limit:
+                    busy_indices = {index for _, index in active.values()}
+                    bbot_busy = any(steps[index].title.startswith('BBOT ') for _, index in active.values())
+                    candidate = next(((root, index) for root, index in pending
+                                      if index not in busy_indices
+                                      and all(dependency in completed[root] for dependency in dependencies.get(index, ()))
+                                      and not (bbot_busy and steps[index].title.startswith('BBOT '))), None)
+                    if candidate is None:
+                        break
+                    root, index = candidate
+                    pending.remove(candidate)
+                    job, step = prepared[root], steps[index]
+                    directory = self.output / job['workspace']
+                    ui_index = stage_offset + index
+                    if self.screen:
+                        self.screen.begin(ui_index, f'{root} | {sum(index in completed[r] for r in self.roots)}/{total} roots completed', step.command, str(directory))
+                    self.message(f'[{phase}] {root}: {step.title} [run]\n  {safe_text(step.command)}\n  cwd: {directory}', ui_index)
+                    try:
+                        self.preflight(step, directory)
+                    except BaseException as error:
+                        if self.screen:
+                            self.screen.fail(ui_index, f'{root}: {error}')
+                        raise
+                    job['status'] = 'running'
+                    self.save()
+                    future = executor.submit(self.execute_step, step, directory, ui_index, cancellation)
+                    active[future] = (root, index)
+                if active:
+                    wait(active, timeout=0.05, return_when=FIRST_COMPLETED)
+                elif pending:
+                    raise RuntimeError('No runnable tasks; collection dependency graph is inconsistent')
+        except BaseException:
+            cancellation.set()
+            raise
+        finally:
+            if failure or interrupted:
+                cancellation.set()
+            # Never leave another tool running after Ctrl+C or a peer failure.
+            executor.shutdown(wait=True, cancel_futures=True)
+            for future, (root, index) in list(active.items()):
+                if not future.cancelled():
+                    record(future, root, index)
+        if interrupted:
+            raise interrupted
+        if failure:
+            raise failure
+
     def run(self):
         phases = ['passive', 'active'] if self.args.mode == 'all' else [self.args.mode]
         stage_offset = 0
         for phase in phases:
-            prepared = {root: self.prepare(root, phase) for root in self.roots}
-            # Source first, then roots: preserve the agreed action order.
-            for index, step in enumerate(self.steps[phase]):
-                if phase == 'passive' and index == 1:
-                    self.message('Manual (no commands supplied): ' + ', '.join(MANUAL))
-                all_cached = True
-                for ordinal, (root, (job, valid)) in enumerate(prepared.items(), 1):
-                    cached = index < valid
-                    all_cached = all_cached and cached
-                    if self.screen:
-                        self.screen.begin(stage_offset + index, f'{root} | root {ordinal}/{len(prepared)}',
-                                          '' if cached else step.command, '' if cached else str(self.output / job['workspace']))
-                    self.message(f'[{phase}] {root}: {step.title} [{"cached" if cached else "planned" if self.args.dry_run else "run"}]')
-                    if cached:
-                        continue
-                    self.message('  ' + redact(step.command))
-                    self.message('  cwd: ' + str(self.output / job['workspace']))
-                    if self.args.dry_run:
-                        continue
-                    if step.title == 'DNSDumpster' and not os.environ.get('DNSDUMPSTER_API_KEY', '').strip():
-                        raise RuntimeError('DNSDUMPSTER_API_KEY is not set; export your DNSDumpster API key before passive/all collection (see --help)')
-                    missing = [name for name in step.tools if not shutil.which(name)]
-                    if missing:
-                        raise RuntimeError('Missing tools: ' + ', '.join(missing))
-                    if step.title.startswith('BBOT '):
-                        if not (Path.home() / '.config/bbot/secrets.yml').is_file():
-                            raise RuntimeError('Missing BBOT secrets.yml; see --help (Docker mount requires a file)')
-                        if not sys.stdin.isatty():
-                            raise RuntimeError('BBOT uses docker -it; run from an interactive terminal')
-                    if step.title == 'PureDNS':
-                        if not (Path.home() / 'selflists/dns/biggest_dnslist.txt').is_file():
-                            raise RuntimeError('Missing ~/selflists/dns/biggest_dnslist.txt')
-                        if not (self.output / job['workspace'] / 'resolvers.txt').is_file():
-                            raise RuntimeError('Missing ~/selflists/dns/resolvers.txt')
-                    job['status'] = 'running'
-                    self.save()
-                    directory = self.output / job['workspace']
-                    if self.screen and self.screen.enabled:
-                        run_command(step.command, directory, self.screen)
-                    else:
-                        run_command(step.command, directory)
-                    missing_files = [name for name in step.outputs if not (directory / name).is_file()]
-                    if missing_files:
-                        raise RuntimeError('Expected output files are missing: ' + ', '.join(missing_files))
-                    job['steps'][str(index)] = {name: file_hash(directory / name) for name in step.outputs}
-                    if index == len(self.steps[phase]) - 1:
-                        job['status'] = 'done'
-                    self.save()
-                if self.screen:
-                    self.screen.finish(stage_offset + index, 'cached' if all_cached else 'planned' if self.args.dry_run else 'done',
-                                       f'{len(prepared)}/{len(prepared)} roots')
+            prepared, completed = {}, {}
+            for root in self.roots:
+                prepared[root], completed[root] = self.prepare(root, phase)
+            for indices in collection_groups(phase):
+                if phase == 'passive' and indices[0] == 2:
+                    self.message('Manual (no commands supplied): ' + ', '.join(MANUAL), stage_offset + 2)
+                self.run_group(phase, indices, prepared, completed, stage_offset)
             stage_offset += len(self.steps[phase])
         if not self.args.dry_run:
             self.export()
 
-    def message(self, text: str):
+    def message(self, text: str, index: int | None = None):
         if self.screen:
-            self.screen.log(text)
+            self.screen.log(text, index)
         else:
             print(text, flush=True)
+
 
     def export(self):
         # Aggregate copies; original per-root command outputs remain untouched.

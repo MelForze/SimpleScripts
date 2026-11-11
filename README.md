@@ -201,26 +201,50 @@ Use `--ui plain` for a normal text log, or `--ui dashboard` to explicitly requir
 the dashboard. Auto mode falls back to plain logs for redirected output, small
 terminals, or when Rich is unavailable. Rich is already a project dependency
 for normal pipx installations. Task selection changes the viewed history;
-collection order and per-root workspaces stay as before. The BBOT confirmation
+per-root workspaces and the dependency group order are preserved. The BBOT confirmation
 flag is described below.
 
 Results default to the current launch directory; `-o` selects another result
 directory. The default is `--mode all`: passive collection first, then active collection.
 `--mode passive` and `--mode active` select one part. Domain-list command variants
 are used even for a single domain. Each root gets an isolated workspace with its
-own `top_domains.txt`; stages run source first across the roots, preserving the
-action order. The collector creates the `subdomains/` directory and copies
+own `top_domains.txt`; dependency groups preserve ordering between stages
+that consume one another's files. The collector creates the `subdomains/` directory and copies
 `~/selflists/dns/resolvers.txt` into active workspaces as `resolvers.txt`. Other paths
 and tool options retain their agreed values.
 
-Passive order: DNSDumpster → manual Subdomainfinder/Pentest-tool/Nmapper/SuIP
-entries (no commands supplied) → crt.sh → Subfinder → Findomain → Assetfinder →
-Docker BBOT → copy BBOT results. Active order: Docker BBOT → copy → PureDNS →
-copy PureDNS findings into `subdomains/` → prepare domain list → DNS records → SRV → extract hosts → IPv4-based PTR via
-`dnsx` → collect findings → prepare/run/collect AXFR → final domains →
-`host -t A` → unique IPv4 addresses. The single-domain, standalone-IP and
-`nets.txt` alternatives are not run in addition to the chosen list variants.
-Company research, leaks, code and job-site sections are outside this version.
+Collection uses the following dependency groups, with at most **two commands
+running globally across all input roots**, and at most **one BBOT** at a time:
+
+1. DNSDumpster, then crt.sh, remain sequential with their original pauses.
+   The manual Subdomainfinder/Pentest-tool/Nmapper/SuIP entries remain visible.
+2. Subfinder, Findomain, Assetfinder and passive BBOT share the two slots.
+   BBOT's copy runs only after that root's BBOT command succeeds.
+3. After passive collection finishes, active BBOT and PureDNS share the slots.
+   Each result copy waits for its own producer.
+4. Domain-list preparation waits for the entire active discovery group.
+5. DNS records and SRV discovery share the slots, using the prepared snapshot.
+6. Host extraction → PTR → DNS findings → AXFR preparation/run/collection →
+   final domains → IPv4 resolution → unique IPv4 remain sequential barriers.
+
+Each source/stage has at most one root running at once; roots share the global
+slots rather than multiplying the concurrency limit. Tool command lines,
+outputs and internal tool rate settings are unchanged. This can increase
+aggregate API traffic compared with the earlier sequential runner; the two-slot
+limit is on commands, not on the tools' internal threads/requests.
+
+The dashboard can show several `running` stages. Each command's output is routed
+to its own task history, and Tab sends input only to the selected running task.
+Switching the viewed task does not move another command's stdin. On a failure,
+no new work is launched, already-running peers are stopped/reaped, and dependent
+groups do not start. Successful completed checkpoints are saved by the single
+coordinator, including independent steps after a failed step. Ctrl+C stops both
+slots and preserves completed work. Failed/interrupted commands restart from
+their beginning in a clean workspace on the next invocation.
+
+The single-domain, standalone-IP and `nets.txt` alternatives are not run in
+addition to the chosen list variants. Company research, leaks, code and job-site
+sections are outside this version.
 
 There are no collector-added rates, request retries, timeouts, host limits or
 UA overrides. In particular, `dnsx -rl 100`, the API-loop `sleep 2`, BBOT's
@@ -260,7 +284,9 @@ Docker, `puredns`/`massdns`, `dig`, `dnsx`, `host` and the shell text tools.
 Use the same output directory when adding root domains. Completed stages are
 checked against output hashes and reused; new roots are collected separately.
 An interrupted/failed command is retried in a clean workspace with copies of
-verified earlier-stage outputs. Use `--refresh` after changing tool configs or
+all verified independent completed outputs. Invalidated producer files also
+invalidate their dependent copy/processing checkpoints; unrelated successful
+providers are reused. Use `--refresh` after changing tool configs or
 keys, or to repeat collection. There is one writer per project. New checkpoints
 are in `.osint/template-state.json`; legacy `template-state.json` checkpoints
 are read if the new state file is absent. The earlier collector's `state.sqlite3` is not
