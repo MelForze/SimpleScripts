@@ -281,6 +281,28 @@ Docker, `puredns`/`massdns`, `dig`, `dnsx`, `host` and the shell text tools.
 - Active collection uses `~/selflists/dns/biggest_dnslist.txt` and
   `~/selflists/dns/resolvers.txt`. The help lists these required paths too.
 
+Before any collection command, a common readiness check reports all detected
+problems together: selected binaries and required options, Docker access,
+BBOT options, required readable nonempty files, DNSDumpster key presence and
+output write access. Missing default Subfinder configs are warnings; explicit
+config overrides must be readable absolute paths. Help/version checks do not
+scan targets. BBOT's help check uses the same Docker image, platform and
+`--pull=always` policy as collection, so it can download/update that image.
+Key validity, paid API limits and remote service availability are not tested.
+`--dry-run` skips all readiness subprocesses and writes.
+
+Active BBOT receives `-s bbot_seeds.txt`: the root and deduplicated passive
+findings inside its original scope. `-t top_domains.txt` continues to define
+scope. Active-only runs reuse available passive results, or start with the root
+alone. This requires BBOT 3's `--seeds` interface, checked before collection.
+After the initial DNS/SRV/PTR/AXFR stages, up to two additional rounds query
+new scoped names discovered in those answers. Already queried names, IPv4
+addresses and zone/NS pairs are excluded; empty rounds invoke no tools.
+Per-round outputs remain under `dns_round_1/` and `dns_round_2/` in the active
+workspace and are merged into the usual top-level DNS exports. New findings
+from the last round enter final domain lists without a third expansion round.
+The final domain collection and IPv4 resolution still run after expansion.
+
 Use the same output directory when adding root domains. Completed stages are
 checked against output hashes and reused; new roots are collected separately.
 An interrupted/failed command is retried in a clean workspace with copies of
@@ -308,6 +330,8 @@ Top-level files aggregate completed workspaces for the input roots:
 ├── top_domains.txt
 ├── domains.txt
 ├── domains_new.txt
+├── bbot_seeds.txt
+├── findings_history.json
 ├── domains_resolved.txt
 ├── scope_ips.txt
 ├── domains_stage.txt
@@ -338,6 +362,18 @@ directory. An input already named `top_domains.txt` in that directory is kept
 verbatim. `domains_new.txt` contains names newly added to the final export by
 this invocation; passive-only runs do not invent a final collection stage.
 Export copies are deduplicated; per-command output files are untouched.
+
+`findings_history.json` retains scoped findings across successful runs, with
+source attribution, roots, first/last observation times and per-source status:
+`confirmed` (observed by a provider in this invocation), `cached` (reused),
+`not_confirmed` (absent from a source refreshed this run), `not_checked`, or
+`out_of_scope` (its root was removed). Cached exports do not advance observation
+dates. Legacy checkpoints without dates import with null observation times.
+Failed/interrupted runs leave the previous history intact; successfully saved
+checkpoints can contribute their original observation dates after resuming.
+Historical names are not automatically put back into current scan targets.
+This upgrade changes active commands, so previous active checkpoints are
+recollected once; unchanged passive checkpoints remain reusable.
 
 The built-in commands use `-n bbot_active` / `-n bbot_passive` and their matching copy
 paths. PureDNS retains its three top-level output files; a following explicit

@@ -42,6 +42,7 @@ class Step:
     command: str
     outputs: tuple[str, ...]
     tools: tuple[str, ...]
+    action: str = ''
 
 
 PASSIVE_FILES = (
@@ -51,6 +52,9 @@ PASSIVE_FILES = (
 )
 MANUAL = ('Subdomainfinder', 'Pentest-tool', 'Nmapper', 'SuIP')
 STATE_FILE = '.osint/template-state.json'
+HISTORY_FILE = 'findings_history.json'
+DNS_ROUNDS = 2
+SEEDS_COMMAND = r'''for file in ./subdomains/subdomains_{dnsdumpster,crtsh,subfinder,findomain,assetfinder,bbot_passive}.txt; do if [ -f "$file" ]; then cat "$file"; fi; done | awk 'NR==FNR {root=tolower($1); sub(/\.$/,"",root); if(root!=""){roots[root]=1; print root}; next} {name=tolower($1); sub(/^\*\./,"",name); sub(/\.$/,"",name); if(name !~ /^[a-z0-9.-]+$/) next; for(root in roots) if(name==root || (length(name)>length(root) && substr(name,length(name)-length(root))=="."root)){print name; break}}' top_domains.txt - | sort -u > bbot_seeds.txt'''
 _execution = threading.local()
 
 
@@ -112,7 +116,7 @@ def redact(command: str) -> str:
 
 def load_steps() -> dict[str, list[Step]]:
     """The agreed domain-list commands, bundled with the standalone script."""
-    return {
+    steps = {
         'passive': [
             Step('DNSDumpster',
                  r'''for domain in $(cat top_domains.txt); do curl -fsS -H "X-API-Key: ${DNSDUMPSTER_API_KEY}" "https://api.dnsdumpster.com/domain/$domain" | jq -r '.a[].host'; sleep 2; done | tr '[:upper:]' '[:lower:]' | sort -u > ./subdomains/subdomains_dnsdumpster.txt''',
@@ -138,7 +142,7 @@ def load_steps() -> dict[str, list[Step]]:
         ],
         'active': [
             Step('BBOT active',
-                 'docker run --platform linux/amd64 --rm -it --pull=always -v "$PWD":/work -w /work -v "$HOME/.config/bbot/secrets.yml":/root/.config/bbot/secrets.yml:ro blacklanternsecurity/bbot:stable -t top_domains.txt -p subdomain-enum -n bbot_active -o . -y',
+                 'docker run --platform linux/amd64 --rm -it --pull=always -v "$PWD":/work -w /work -v "$HOME/.config/bbot/secrets.yml":/root/.config/bbot/secrets.yml:ro blacklanternsecurity/bbot:stable -t top_domains.txt -s bbot_seeds.txt -p subdomain-enum -n bbot_active -o . -y',
                  ('bbot_active/subdomains.txt',), ('docker',)),
             Step('Copy BBOT active',
                  'cp ./bbot_active/subdomains.txt ./subdomains/subdomains_bbot_active.txt',
@@ -187,6 +191,41 @@ def load_steps() -> dict[str, list[Step]]:
                  ('scope_ips.txt',), ('awk', 'sort')),
         ],
     }
+    active = steps['active']
+    rounds = []
+    for number in range(1, DNS_ROUNDS + 1):
+        prefix = f'dns_round_{number}/'
+        rounds.append(Step(f'DNS round {number}: Prepare new names',
+                           f'[collector] prepare {prefix}domains_stage.txt (new scoped names only)',
+                           (prefix + 'domains_stage.txt',), (), f'round:{number}'))
+        # Reuse the agreed DNS/SRV/extraction commands, changing only their
+        # paths. Keep each round immutable so checkpoint hashes stay valid.
+        for original in active[5:13]:
+            command = original.command
+            names = ('domains_stage.txt', 'dns_records.txt', 'srv_records.txt',
+                     'dns_hosts_candidates.txt', 'ptr_hosts_candidates.txt',
+                     'dns_zones_ns.txt', 'axfr_result.txt')
+            command = re.sub(r'(?<![\w/])(' + '|'.join(map(re.escape, names)) + r')(?![\w.])',
+                             lambda match: prefix + match[0], command)
+            command = command.replace('./subdomains/', prefix + 'subdomains/')
+            outputs = tuple(prefix + name for name in original.outputs)
+            action = ''
+            if original.title == 'Reverse DNS / PTR':
+                command = (f'dnsx -ptr -resp-only -silent -rl 100 < {prefix}ptr_ips.txt'
+                           r" | sed 's/\.$//' | tr '[:upper:]' '[:lower:]' | sort -u > "
+                           + prefix + 'ptr_hosts_candidates.txt')
+                outputs += (prefix + 'ptr_ips.txt',)
+                action = f'ptr:{number}'
+            elif original.title == 'Prepare AXFR':
+                action = f'zones:{number}'
+            rounds.append(Step(f'DNS round {number}: {original.title}', command,
+                               outputs, original.tools, action))
+    steps['active'] = [Step('Prepare BBOT seeds', SEEDS_COMMAND, ('bbot_seeds.txt',), ('cat', 'awk', 'sort')),
+                       *active[:13], *rounds,
+                       Step('Collect DNS rounds', '[collector] merge scoped round findings',
+                            ('subdomains/subdomains_dns_rounds.txt',), (), 'merge-rounds'),
+                       *active[13:]]
+    return steps
 
 
 def config_help() -> str:
@@ -251,6 +290,8 @@ def config_help() -> str:
     bbot_active/<root>/ and bbot_passive/<root>/: BBOT reports.
     Other result/DNS/PureDNS files: directly in the result directory.
     .osint/: checkpoints and isolated command workspaces.
+    findings_history.json: sources, observation dates and per-run status.
+    Cached findings keep their observation dates; failed runs do not replace history.
   Tool installation: --install-tools (no -i; installs missing tools then exits).
     --install-tools --dry-run: offline read-only plan.
     macOS: Homebrew. Linux: Debian/Ubuntu/Kali, Fedora, Arch/Manjaro.
@@ -271,6 +312,16 @@ def config_help() -> str:
     Groups wait for dependencies; a failure stops peers and blocks later groups.
     Tab sends input only to the selected running task; logs stay separate.
   BBOT: -y skips its scan-start confirmation in both passive and active passes.
+    Active BBOT uses -s bbot_seeds.txt (root + scoped passive findings).
+    -t top_domains.txt still defines scope. Requires BBOT 3 --seeds support.
+  Readiness: checks all selected tools/options, Docker/BBOT, required files,
+    DNSDumpster key presence and output write access before collection starts.
+    BBOT --help uses the same image/platform/pull policy; it may download the image.
+    API key validity/plan limits and remote service availability are not verified.
+  DNS expansion: up to 2 extra rounds after the initial AXFR, before final lists.
+    Only new scoped names, IPv4 addresses and zone/NS pairs are queried.
+    Empty queues skip tools. Round outputs stay separate in the workspace;
+    exports combine them with the initial DNS/SRV/PTR/AXFR files.
   Commands require Bash/POSIX tools (macOS/Linux, or a matching WSL environment).
   Commands are bundled with this script; no Markdown files are required.
   Domain-list variants are used, including for a single root. PTR uses IPv4
@@ -283,7 +334,7 @@ def config_help() -> str:
 def read_roots(path: Path) -> list[str]:
     roots = []
     for raw in path.read_text(encoding='utf-8').splitlines():
-        root = raw.strip()
+        root = raw.strip().lower()
         if not root or root.startswith('#'):
             continue
         if len(root) > 253 or '.' not in root or not re.fullmatch(r'[a-zA-Z0-9.-]+', root) or any(
@@ -1181,18 +1232,180 @@ def install_tools(mode: str, dry_run: bool, ui_mode: str) -> int:
     return 0
 
 
+def readiness(args, steps, report=print):
+    """Check the entire selected plan before starting any collection command."""
+    if args.dry_run:
+        return
+    phases = ('passive', 'active') if args.mode == 'all' else (args.mode,)
+    selected = [step for phase in phases for step in steps[phase]]
+    tools = sorted({'bash', *(tool for step in selected for tool in step.tools)})
+    errors, warnings = [], []
+    available = {tool: shutil.which(tool) for tool in tools}
+    errors.extend('Missing tool: ' + tool for tool, binary in available.items() if not binary)
+
+    def readable(path, label, required=True):
+        try:
+            with path.open('rb') as handle:
+                if not handle.read(1):
+                    raise ValueError('file is empty')
+        except (OSError, ValueError) as error:
+            (errors if required else warnings).append(f'{label}: {path} ({error})')
+
+    if 'passive' in phases and not os.environ.get('DNSDUMPSTER_API_KEY', '').strip():
+        errors.append('DNSDUMPSTER_API_KEY is not set; see --help')
+    if 'docker' in tools:
+        readable(Path.home() / '.config/bbot/secrets.yml', 'BBOT secrets')
+        if not sys.stdin.isatty():
+            errors.append('BBOT uses docker -it; run from an interactive terminal')
+    if 'active' in phases:
+        for name in ('biggest_dnslist.txt', 'resolvers.txt'):
+            readable(Path.home() / 'selflists/dns' / name, 'Active input')
+
+    # Probe actual write access, including existing export directories. Never
+    # leave a test file behind, and do not create the project during dry-run.
+    output = args.output.resolve()
+    for target in {output, *(output / name for name in ('.osint', 'subdomains', 'bbot_active', 'bbot_passive'))}:
+        parent = target
+        while not parent.exists():
+            parent = parent.parent
+        try:
+            with tempfile.TemporaryFile(dir=parent) as handle:
+                handle.write(b'write check')
+                handle.flush()
+        except OSError as error:
+            errors.append(f'Cannot write {target}: {error}')
+    owned = {STATE_FILE, HISTORY_FILE, 'top_domains.txt', 'domains_new.txt',
+             *(name for step in selected for name in step.outputs)}
+    for name in sorted(owned):
+        path = output / name
+        if name == 'top_domains.txt' and path.resolve() == args.input.resolve():
+            continue
+        if path.exists() and (not path.is_file() or not os.access(path, os.W_OK)):
+            errors.append(f'Output is not a writable file: {path}')
+
+    def probe(tool, arguments, flags=(), timeout=15):
+        if not available.get(tool):
+            return ''
+        report('Readiness: ' + tool + ' ' + ' '.join(arguments))
+        try:
+            result = subprocess.run([available[tool], *arguments], stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, errors='replace', timeout=timeout)
+            output = re.sub(r'\x1b\[[0-9;]*m', '', result.stdout + result.stderr)
+            if result.returncode:
+                errors.append(f'{tool} {" ".join(arguments)} exited {result.returncode}: {safe_text(output[-1200:]).strip()}')
+            else:
+                missing = [flag for flag in flags if not re.search(
+                    r'(?<![\w-])' + (r'--?' + re.escape(flag[2:]) if flag.startswith('--') else re.escape(flag)) + r'(?![\w-])', output)]
+                if missing:
+                    errors.append(f'{tool}: installed version lacks required options: {", ".join(missing)}')
+            return output if result.returncode == 0 else ''
+        except (OSError, subprocess.SubprocessError) as error:
+            errors.append(f'{tool} readiness check failed: {error}')
+            return ''
+
+    for tool, arguments, flags in (
+        ('bash', ['--version'], ()), ('curl', ['--version'], ()), ('jq', ['--version'], ()),
+        ('findomain', ['--help'], ('-f', '-u')),
+        ('assetfinder', ['--help'], ('--subs-only',)),
+        ('puredns', ['bruteforce', '--help'], ('-d', '-r', '-w', '--write-massdns', '--write-wildcards')),
+        ('massdns', ['--help'], ()), ('dig', ['-v'], ()),
+        ('dnsx', ['-h'], ('-ptr', '-resp-only', '-silent', '-rl')),
+    ):
+        probe(tool, arguments, flags)
+    help_text = probe('subfinder', ['-h'], ('-dL', '-all', '-o'))
+    if 'subfinder' in tools:
+        # Defaults come from this installed binary, with its OS-specific paths.
+        # Missing optional provider configs reduce coverage; explicit overrides
+        # must be readable. Never parse or display API key contents.
+        for flag, env in (('config', 'SUBFINDER_CONFIG'), ('provider-config', 'SUBFINDER_PROVIDER_CONFIG')):
+            configured = os.environ.get(env)
+            match = next((re.search(r'\(default "([^"]+)"\)', line) for line in help_text.splitlines()
+                          if re.search(r'(?:^|[ ,])-' + flag + r'\s', line)), None)
+            path = configured or (match[1] if match else None)
+            if path:
+                file = Path(path).expanduser()
+                if not file.is_absolute():
+                    errors.append(f'{env}: use an absolute path; tools run in isolated workspaces')
+                else:
+                    readable(file, f'Subfinder {flag}', required=bool(configured))
+            elif not configured:
+                warnings.append(f'Subfinder {flag} path could not be detected; see subfinder -h')
+    if available.get('docker'):
+        probe('docker', ['run', '--help'], ('--platform', '--pull', '--volume', '--workdir'))
+        engine = probe('docker', ['info'])
+        if engine:
+            # This uses the same platform/image/pull policy as the agreed scan.
+            # No target, key mount or interactive terminal is passed to --help.
+            flags = ('-t', '-p', '-rf', '-n', '-o', '-y')
+            if 'active' in phases:
+                flags += ('--seeds',)
+            probe('docker', ['run', '--platform', 'linux/amd64', '--rm', '--pull=always',
+                             'blacklanternsecurity/bbot:stable', '--help'], flags, timeout=120)
+    for warning in warnings:
+        report('Readiness warning: ' + safe_text(warning))
+    if errors:
+        raise RuntimeError('Readiness failed; collection has not started:\n' +
+                           '\n'.join(f'  {index}. {safe_text(error)}' for index, error in enumerate(errors, 1)))
+    report('Readiness: all required checks passed')
+
+
 def collection_groups(phase: str) -> tuple[tuple[int, ...], ...]:
     if phase == 'passive':
         return ((0,), (1,), (2, 3, 4, 5, 6))
-    return ((0, 1, 2, 3), (4,), (5, 6), *((index,) for index in range(7, 16)))
+    groups = [(0,), (1, 2, 3, 4), (5,), (6, 7), *((index,) for index in range(8, 14))]
+    for number in range(DNS_ROUNDS):
+        start = 14 + number * 9
+        groups.extend([(start,), (start + 1, start + 2),
+                       *((index,) for index in range(start + 3, start + 9))])
+    groups.extend((index,) for index in range(14 + DNS_ROUNDS * 9, 18 + DNS_ROUNDS * 9))
+    return tuple(groups)
 
 
 def step_dependencies(phase: str) -> dict[int, tuple[int, ...]]:
     if phase == 'passive':
         return {6: (5,)}
-    return {1: (0,), 3: (2,), 4: (1, 3), 5: (4,), 6: (4,), 7: (5, 6),
-            8: (5,), 9: (7, 8), 10: (5,), 11: (10,), 12: (11,),
-            13: (1, 3, 9, 12), 14: (13,), 15: (14,)}
+    result = {1: (0,), 2: (1,), 4: (3,), 5: (2, 4), 6: (5,), 7: (5,),
+              8: (6, 7), 9: (6,), 10: (8, 9), 11: (6,), 12: (11,), 13: (12,)}
+    previous = (5, 10, 13)
+    for number in range(DNS_ROUNDS):
+        start = 14 + number * 9
+        result.update({start: previous, start + 1: (start,), start + 2: (start,),
+                       start + 3: (start + 1, start + 2), start + 4: (start + 1,),
+                       start + 5: (start + 3, start + 4), start + 6: (start + 1,),
+                       start + 7: (start + 6,), start + 8: (start + 7,)})
+        previous = (start, start + 5, start + 8)
+    merge = 14 + DNS_ROUNDS * 9
+    result.update({merge: previous, merge + 1: (2, 4, 10, 13, merge),
+                   merge + 2: (merge + 1,), merge + 3: (merge + 2,)})
+    return result
+
+
+def lines(path: Path) -> list[str]:
+    return path.read_text(encoding='utf-8').splitlines() if path.is_file() else []
+
+
+def scoped_names(values, roots) -> set[str]:
+    roots = [root.lower().rstrip('.') for root in roots]
+    result = set()
+    for value in values:
+        name = value.strip().lower().rstrip('.')
+        if name.startswith('*.'):
+            name = name[2:]
+        if len(name) > 253 or not all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+                                      for label in name.split('.')):
+            continue
+        if any(name == root or name.endswith('.' + root) for root in roots):
+            result.add(name)
+    return result
+
+
+def write_lines(path: Path, values):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_text(path, ''.join(value + '\n' for value in sorted(set(values))))
+
+
+def utc_now() -> str:
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
 
 class Collector:
@@ -1208,6 +1421,12 @@ class Collector:
             raise ValueError('Unsupported collector state schema')
         self.jobs = self.state['jobs']
         self.current = {}
+        self.fresh = set()
+        self.run_id = str(time.time_ns())
+        history_path = self.output / HISTORY_FILE
+        self.history = json.loads(history_path.read_text()) if history_path.exists() else {'schema': 1, 'findings': {}}
+        if self.history.get('schema') != 1 or not isinstance(self.history.get('findings'), dict):
+            raise ValueError('Unsupported findings history schema')
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1255,7 +1474,7 @@ class Collector:
         else:
             valid = set()
         relative = f'.osint/runs/{root}/{phase}-{time.time_ns()}'
-        job = {'definition': definition, 'workspace': relative, 'steps': {}, 'status': 'pending'}
+        job = {'definition': definition, 'workspace': relative, 'steps': {}, 'observed_at': {}, 'status': 'pending'}
         self.current[(root, phase)] = job
         if self.args.dry_run:
             return job, valid
@@ -1274,6 +1493,9 @@ class Collector:
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(self.output / old['workspace'] / name, destination)
                 job['steps'][str(index)] = old['steps'][str(index)]
+                timestamp = old.get('observed_at', {}).get(str(index))
+                if timestamp:
+                    job['observed_at'][str(index)] = timestamp
         self.jobs[key] = job
         self.save()
         return job, valid
@@ -1300,10 +1522,55 @@ class Collector:
         # owns checkpoint mutation, saving and dependency transitions.
         _execution.cancellation = cancellation
         try:
-            if self.screen and self.screen.enabled:
-                run_command(step.command, directory, self.screen.bind(index))
+            for name in step.outputs:
+                (directory / name).parent.mkdir(parents=True, exist_ok=True)
+            round_match = re.search(r'dns_round_(\d+)/', step.outputs[0]) if step.outputs else None
+            number = int(round_match[1]) if round_match else None
+            roots = lines(directory / 'top_domains.txt')
+            if step.action.startswith('round:'):
+                checked = set(scoped_names(lines(directory / 'domains_stage.txt'), roots))
+                candidates = set()
+                for parent in [directory, *(directory / f'dns_round_{n}' for n in range(1, number))]:
+                    checked.update(scoped_names(lines(parent / 'domains_stage.txt'), roots))
+                    for path in (parent / 'subdomains').glob('subdomains_*.txt'):
+                        candidates.update(scoped_names(lines(path), roots))
+                write_lines(directory / step.outputs[0], candidates - checked)
+                self.message(f'DNS round {number}: {len(candidates - checked)} new scoped names', index)
+            elif step.action == 'merge-rounds':
+                values = set()
+                for n in range(1, DNS_ROUNDS + 1):
+                    for path in (directory / f'dns_round_{n}/subdomains').glob('subdomains_*.txt'):
+                        values.update(scoped_names(lines(path), roots))
+                write_lines(directory / step.outputs[0], values)
+            elif number and not lines(directory / f'dns_round_{number}/domains_stage.txt'):
+                for name in step.outputs:
+                    write_lines(directory / name, ())
+                self.message(f'DNS round {number}: empty queue, command skipped', index)
             else:
-                run_command(step.command, directory)
+                if step.action.startswith('ptr:'):
+                    def ips(path):
+                        return {parts[4] for line in lines(path) if len(parts := line.split()) >= 5
+                                and parts[2:4] == ['IN', 'A']}
+                    previous = ips(directory / 'dns_records.txt')
+                    for n in range(1, number):
+                        previous.update(ips(directory / f'dns_round_{n}/dns_records.txt'))
+                    write_lines(directory / f'dns_round_{number}/ptr_ips.txt',
+                                ips(directory / f'dns_round_{number}/dns_records.txt') - previous)
+                if self.screen and self.screen.enabled:
+                    run_command(step.command, directory, self.screen.bind(index))
+                else:
+                    run_command(step.command, directory)
+                if step.title in ('Prepare Domain List', 'Prepare BBOT seeds'):
+                    write_lines(directory / step.outputs[0], scoped_names(lines(directory / step.outputs[0]), roots))
+                if step.action.startswith('zones:'):
+                    def zones(path):
+                        return {' '.join(part.lower().rstrip('.') for part in line.split())
+                                for line in lines(path) if len(line.split()) == 2}
+                    previous = zones(directory / 'dns_zones_ns.txt')
+                    for n in range(1, number):
+                        previous.update(zones(directory / f'dns_round_{n}/dns_zones_ns.txt'))
+                    path = directory / step.outputs[0]
+                    write_lines(path, zones(path) - previous)
             missing = [name for name in step.outputs if not (directory / name).is_file()]
             if missing:
                 raise RuntimeError('Expected output files are missing: ' + ', '.join(missing))
@@ -1369,6 +1636,8 @@ class Collector:
                     self.screen.fail(ui_index, f'{root}: {error}')
             else:
                 job['steps'][str(index)] = hashes
+                job.setdefault('observed_at', {})[str(index)] = utc_now()
+                self.fresh.add((root, phase, index))
                 completed[root].add(index)
                 job['status'] = 'done' if len(completed[root]) == len(steps) else 'running' if any(r == root for r, _ in active.values()) else 'pending'
                 count = sum(index in completed[r] for r in self.roots)
@@ -1454,6 +1723,82 @@ class Collector:
         else:
             print(text, flush=True)
 
+    def export_history(self):
+        observations, checked = {}, set()
+        for (root, phase), job in self.current.items():
+            if job.get('status') != 'done':
+                continue
+            directory = self.output / job['workspace']
+            steps = self.steps[phase]
+            for index, step in enumerate(steps):
+                source = None
+                paths = ()
+                title = step.title.split(': ', 1)[-1]
+                if phase == 'passive' and title not in ('Copy BBOT passive',):
+                    source, paths = title, step.outputs
+                elif title in ('BBOT active', 'PureDNS'):
+                    source, paths = title, step.outputs[:1]
+                elif title == 'Extract Hosts from DNS Records':
+                    source, paths = 'DNS/SRV', step.outputs
+                elif title == 'Reverse DNS / PTR':
+                    source, paths = 'PTR', step.outputs[:1]
+                elif title == 'Collect AXFR':
+                    source, paths = 'AXFR', step.outputs
+                if not source:
+                    continue
+                # Derived files inherit the observation times of their actual
+                # providers, not a later copy/extraction/re-export operation.
+                producers = (index,)
+                if source == 'DNS/SRV':
+                    producers = (index - 2, index - 1)
+                elif source == 'AXFR':
+                    producers = (index - 1,)
+                empty_round = any(name.startswith('dns_round_') and
+                                  not lines(directory / name.split('/')[0] / 'domains_stage.txt') for name in paths)
+                fresh = not empty_round and any((root, phase, producer) in self.fresh for producer in producers)
+                if fresh:
+                    checked.add((root, source))
+                timestamps = [job.get('observed_at', {}).get(str(producer)) for producer in producers]
+                timestamp = max((value for value in timestamps if value), default=None)
+                for path in paths:
+                    for name in scoped_names(lines(directory / path), [root]):
+                        observations.setdefault((name, source), []).append((root, timestamp, fresh))
+
+        findings = self.history['findings']
+        for (name, source), values in observations.items():
+            finding = findings.setdefault(name, {'first_recorded_at': utc_now(), 'sources': {}, 'roots': []})
+            finding['roots'] = sorted(set(finding['roots']) | {value[0] for value in values})
+            evidence = finding['sources'].setdefault(source, {'first_seen': None, 'last_seen': None})
+            dates = [value[1] for value in values if value[1]]
+            if dates:
+                evidence['first_seen'] = min([*dates, *([evidence['first_seen']] if evidence['first_seen'] else [])])
+                evidence['last_seen'] = max([*dates, *([evidence['last_seen']] if evidence['last_seen'] else [])])
+        for name, finding in findings.items():
+            in_scope = bool(scoped_names([name], self.roots))
+            for source, evidence in finding['sources'].items():
+                values = observations.get((name, source), ())
+                if not in_scope:
+                    status = 'out_of_scope'
+                elif any(value[2] for value in values):
+                    status = 'confirmed'
+                elif values:
+                    status = 'cached'
+                elif any(candidate_source == source and scoped_names([name], [root]) for root, candidate_source in checked):
+                    status = 'not_confirmed'
+                else:
+                    status = 'not_checked'
+                evidence['status'] = status
+            statuses = {evidence['status'] for evidence in finding['sources'].values()}
+            finding['status'] = next(status for status in ('confirmed', 'cached', 'not_confirmed', 'not_checked', 'out_of_scope') if status in statuses)
+            dates = [evidence['first_seen'] for evidence in finding['sources'].values() if evidence['first_seen']]
+            finding['first_seen'] = min(dates, default=None)
+            dates = [evidence['last_seen'] for evidence in finding['sources'].values() if evidence['last_seen']]
+            finding['last_seen'] = max(dates, default=None)
+        self.history['last_run'] = {'id': self.run_id, 'completed_at': utc_now(), 'mode': self.args.mode,
+                                    'refresh': self.args.refresh, 'roots': self.roots}
+        atomic_text(self.output / HISTORY_FILE, json.dumps(self.history, indent=2, sort_keys=True) + '\n')
+        self.message(f'History: {self.output / HISTORY_FILE} ({len(findings)} names retained)')
+
 
     def export(self):
         # Aggregate copies; original per-root command outputs remain untouched.
@@ -1473,6 +1818,10 @@ class Collector:
                     if name.startswith(('bbot_active/', 'bbot_passive/')):
                         continue
                     path = directory / name
+                    if name.startswith('dns_round_'):
+                        name = name.split('/', 1)[1]
+                        if name == 'ptr_ips.txt':
+                            continue
                     if path.is_file():
                         merged.setdefault(name, set()).update(path.read_text(encoding='utf-8').splitlines())
         for name, values in merged.items():
@@ -1495,6 +1844,7 @@ class Collector:
         if self.args.input.resolve() != (self.output / 'top_domains.txt').resolve():
             atomic_text(self.output / 'top_domains.txt', '\n'.join(self.roots) + '\n')
         self.state['exports'] = sorted(exports)
+        self.export_history()
         self.save()
         self.message(f'Results: {self.output}')
 
@@ -1529,6 +1879,7 @@ def main(argv=None) -> int:
             raise ValueError('These Bash/Docker commands require a POSIX environment (e.g. WSL)')
         steps = load_steps()
         roots = read_roots(args.input)
+        readiness(args, steps)
         phases = ['passive', 'active'] if args.mode == 'all' else [args.mode]
         labels = [f'{phase}: {step.title}' for phase in phases for step in steps[phase]]
         with project_lock(args.output.resolve() / '.osint', args.dry_run), TaskScreen('OSINT collection', labels, args.ui) as screen:

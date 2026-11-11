@@ -34,3 +34,5 @@ test_inputs/
 /puredns_subdomains.txt
 /puredns_massdns.txt
 /puredns_wildcards.txt
+/bbot_seeds.txt
+/findings_history.json
