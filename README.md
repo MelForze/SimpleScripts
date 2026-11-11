@@ -117,9 +117,9 @@ following, or remove `-fr` to retain redirect-based directory recursion.
 executes them in the established OSINT action order. It is self-contained:
 `Passive Actions.md`, `Active Actions.md`, and the `Pentest Template/` directory
 are not read or required at runtime. The same commands are bundled in pipx
-installations; `--templates` has been removed. The only intentional command
-change is that the DNSDumpster header reads its key from the environment instead
-of embedding a literal key from Markdown.
+installations; `--templates` has been removed. The DNSDumpster header reads its key from the environment instead
+of embedding a literal key from Markdown; BBOT includes the agreed `-y` flag
+for automatic scan-start confirmation.
 
 From the repository root for a local checkout:
 
@@ -179,16 +179,30 @@ provider configs, resolver files or wordlists. These still need your own data.
 
 On an interactive terminal with Rich and enough room, both installation and
 collection show a two-column dashboard: task states on the left; current root,
-command, working directory and live stdout/stderr on the right. The task list
-follows the current command. Recent output is bounded to 300 lines in memory.
-Color and carriage-return progress output are supported. Tool prompts retain
-stdin, including Docker BBOT's `-it`. Ctrl+C terminates the owned process group
-and restores the terminal; already completed collection stages stay saved.
+command, working directory and live stdout/stderr on the right. Up/Down selects
+a task independently of the running task;
+PgUp/PgDn scroll its output and `f` returns to following the active task. Each
+task keeps its own latest 300 output lines, including after it finishes and
+across roots within that stage. Wrapped output is cropped to the actual pane
+size; child cursor/title/clipboard controls cannot move or expand the dashboard.
+Rendering uses one timer at four frames per second, independently of log volume.
+In tmux, both ordinary and application-mode arrow sequences are accepted.
+
+Tab switches between task navigation and input to the active tool. Tool input
+uses a separate pseudo-terminal so Docker BBOT's `-it` still receives a TTY;
+letters such as `f` and arrow keys go to the tool while that mode is selected.
+Tab returns to navigation. sudo/system installer prompts temporarily use the
+native terminal with the navigation reader stopped; their passwords are not
+captured. Terminal attributes are restored on completion, errors and Ctrl+C.
+Ctrl+C terminates the owned process group; completed collection stages stay saved.
+After a failure, the task name, details, command, cwd and last 20 output lines
+are printed outside the alternate screen so the actual stderr is not lost.
 Use `--ui plain` for a normal text log, or `--ui dashboard` to explicitly require
 the dashboard. Auto mode falls back to plain logs for redirected output, small
 terminals, or when Rich is unavailable. Rich is already a project dependency
-for normal pipx installations. The screen changes presentation only; collection
-commands, their ordering and per-root workspaces stay as before.
+for normal pipx installations. Task selection changes the viewed history;
+collection order and per-root workspaces stay as before. The BBOT confirmation
+flag is described below.
 
 Results default to the current launch directory; `-o` selects another result
 directory. The default is `--mode all`: passive collection first, then active collection.
@@ -212,7 +226,10 @@ There are no collector-added rates, request retries, timeouts, host limits or
 UA overrides. In particular, `dnsx -rl 100`, the API-loop `sleep 2`, BBOT's
 `--platform linux/amd64 --rm -it --pull=always`, and PureDNS's wordlist path come
 from the agreed commands. AXFR is executed at its established position.
-BBOT requires an interactive terminal because its command retains `-it`.
+BBOT uses `-y` in both passive and active passes to skip the scan-start
+confirmation. This does not add `--force` or change module selection. The agreed
+Docker `-it` is retained; terminal input is proxied in dashboard mode. Adding
+`-y` does not invalidate completed collection checkpoints.
 The commands require Bash/POSIX tools; use macOS/Linux or a matching
 WSL environment. Install `curl`, `jq`, `subfinder`, `findomain`, `assetfinder`,
 Docker, `puredns`/`massdns`, `dig`, `dnsx`, `host` and the shell text tools.

@@ -6,8 +6,9 @@ import argparse
 import codecs
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
+import errno
 import json
 import os
 import platform
@@ -19,12 +20,19 @@ import shlex
 import signal
 import ssl
 import subprocess
+import struct
+import threading
 import sys
 import tarfile
 import tempfile
 import time
 from urllib.request import Request, urlopen
 import zipfile
+
+if os.name == "posix":
+    import fcntl
+    import termios
+    import tty
 
 
 @dataclass(frozen=True)
@@ -116,7 +124,7 @@ def load_steps() -> dict[str, list[Step]]:
                  'cat top_domains.txt | assetfinder --subs-only | sort -u > ./subdomains/subdomains_assetfinder.txt',
                  (PASSIVE_FILES[4],), ('assetfinder', 'cat', 'sort')),
             Step('BBOT passive',
-                 'docker run --platform linux/amd64 --rm -it --pull=always -v "$PWD":/work -w /work -v "$HOME/.config/bbot/secrets.yml":/root/.config/bbot/secrets.yml:ro blacklanternsecurity/bbot:stable -t top_domains.txt -p subdomain-enum -rf passive -n bbot_passive -o .',
+                 'docker run --platform linux/amd64 --rm -it --pull=always -v "$PWD":/work -w /work -v "$HOME/.config/bbot/secrets.yml":/root/.config/bbot/secrets.yml:ro blacklanternsecurity/bbot:stable -t top_domains.txt -p subdomain-enum -rf passive -n bbot_passive -o . -y',
                  ('bbot_passive/subdomains.txt',), ('docker',)),
             Step('Copy BBOT passive',
                  'cp ./bbot_passive/subdomains.txt ./subdomains/subdomains_bbot_passive.txt',
@@ -124,7 +132,7 @@ def load_steps() -> dict[str, list[Step]]:
         ],
         'active': [
             Step('BBOT active',
-                 'docker run --platform linux/amd64 --rm -it --pull=always -v "$PWD":/work -w /work -v "$HOME/.config/bbot/secrets.yml":/root/.config/bbot/secrets.yml:ro blacklanternsecurity/bbot:stable -t top_domains.txt -p subdomain-enum -n bbot_active -o .',
+                 'docker run --platform linux/amd64 --rm -it --pull=always -v "$PWD":/work -w /work -v "$HOME/.config/bbot/secrets.yml":/root/.config/bbot/secrets.yml:ro blacklanternsecurity/bbot:stable -t top_domains.txt -p subdomain-enum -n bbot_active -o . -y',
                  ('bbot_active/subdomains.txt',), ('docker',)),
             Step('Copy BBOT active',
                  'cp ./bbot_active/subdomains.txt ./subdomains/subdomains_bbot_active.txt',
@@ -245,8 +253,13 @@ def config_help() -> str:
     Docker must also be running and accessible; WSL uses Desktop integration.
     Configs/API keys, wordlists and resolvers are not installed or overwritten.
   Display: --ui auto uses a two-column task/live-output dashboard on a suitable
-    terminal with Rich; --ui plain keeps a text log. No keyboard capture:
-    subprocess prompts keep using stdin. Ctrl+C stops the current process.
+    terminal with Rich; --ui plain keeps a text log.
+    Up/Down: select task. PgUp/PgDn: scroll. f: follow the running task.
+    Tab: switch between task navigation and the active tool's terminal input.
+    Ctrl+C stops collection. sudo/system installers use their native terminal.
+    Each task retains its latest 300 output lines; long output stays in its pane.
+    On failure, task, command, cwd and recent output remain visible after exit.
+  BBOT: -y skips its scan-start confirmation in both passive and active passes.
   Commands require Bash/POSIX tools (macOS/Linux, or a matching WSL environment).
   Commands are bundled with this script; no Markdown files are required.
   Domain-list variants are used, including for a single root. PTR uses IPv4
@@ -274,17 +287,35 @@ def read_roots(path: Path) -> list[str]:
     return roots
 
 
+@dataclass
+class TaskOutput:
+    lines: deque = field(default_factory=lambda: deque(maxlen=300))
+    partial: str = ''
+    carriage: bool = False
+    command: str = ''
+    cwd: str = ''
+    offset: int = 0
+    ansi: str = ''
+    escape: str = ''
+
+
 class TaskScreen:
-    """Two-column terminal display; plain output stays usable without Rich."""
+    """Independent task selection, bounded terminal histories and safe input."""
     def __init__(self, title: str, labels: list[str], mode: str = 'auto'):
         self.title, self.labels = title, labels
         self.states = ['waiting'] * len(labels)
         self.details = [''] * len(labels)
-        self.current = 0
-        self.command = self.cwd = ''
-        self.lines = deque(maxlen=300)
-        self.partial = ''
-        self.carriage = False
+        self.outputs = [TaskOutput() for _ in labels]
+        self.current = self.selected = 0
+        self.follow = True
+        self.input_mode = False
+        self.page_size = 10
+        self.lock = threading.RLock()
+        self._input_fd = self._original_tty = self._keyboard = None
+        self._stop_keyboard = threading.Event()
+        self._child_input = None
+        self._pending_input = bytearray()
+        self._keys = b''
         self.live = None
         self.enabled = False
         self.started = time.monotonic()
@@ -303,79 +334,274 @@ class TaskScreen:
             from rich.text import Text
         except ImportError:
             if mode == 'dashboard':
-                raise ValueError('Dashboard requires Rich; install the project with its dependencies, or use --ui plain') from None
+                raise ValueError('Dashboard requires Rich; install project dependencies or use --ui plain') from None
             return
-        self.Console, self.Layout, self.Live = Console, Layout, Live
-        self.Panel, self.Table, self.Text = Panel, Table, Text
+        self.Layout, self.Live, self.Panel, self.Table, self.Text = Layout, Live, Panel, Table, Text
         self.console = Console()
         self.enabled = True
+
+    @property
+    def lines(self):
+        return self.outputs[self.current].lines
+
+    @property
+    def partial(self):
+        return self.outputs[self.current].partial
+
+    @property
+    def command(self):
+        return self.outputs[self.current].command
+
+    @property
+    def cwd(self):
+        return self.outputs[self.current].cwd
 
     def __enter__(self):
         if self.enabled:
             self.live = self.Live(get_renderable=self.render, console=self.console, screen=True,
-                                  refresh_per_second=4, redirect_stdout=False, redirect_stderr=False)
+                                  refresh_per_second=4, vertical_overflow='crop',
+                                  redirect_stdout=False, redirect_stderr=False)
             self.live.start(refresh=True)
+            try:
+                self._start_input()
+            except BaseException:
+                self.live.stop()
+                raise
         return self
 
     def __exit__(self, kind, value, traceback):
+        self._stop_input()
         if self.live:
             if kind:
-                self.states[self.current] = 'interrupted' if kind is KeyboardInterrupt else 'failed'
+                self.states[self.current] = 'interrupted' if issubclass(kind, KeyboardInterrupt) else 'failed'
                 self.feed(str(value or 'Interrupted') + '\n')
-            self.refresh()
+            self.live.refresh()
             self.live.stop()
             completed = sum(state in ('done', 'cached', 'installed', 'present') for state in self.states)
             print(f'{self.title}: {completed}/{len(self.labels)} completed' + ('; interrupted/failed' if kind else ''), flush=True)
+            if kind:
+                self.print_failure()
+
+    def print_failure(self):
+        """Keep diagnostics visible after leaving the alternate screen."""
+        log = self.outputs[self.current]
+        print('Task: ' + self.labels[self.current], file=sys.stderr)
+        if self.details[self.current]:
+            print('Details: ' + self.details[self.current], file=sys.stderr)
+        if log.command:
+            print('Command: ' + safe_text(log.command), file=sys.stderr)
+        if log.cwd:
+            print('cwd: ' + log.cwd, file=sys.stderr)
+        lines = list(log.lines) + ([log.partial] if log.partial else [])
+        if lines:
+            print('Last output:', file=sys.stderr)
+            for line in lines[-20:]:
+                print(self.Text.from_ansi(safe_text(line)).plain, file=sys.stderr)
 
     def log(self, message: str):
         if self.enabled:
             self.feed(message + '\n')
-            self.refresh()
         else:
             print(message, flush=True)
 
     def begin(self, index: int, detail: str = '', command: str = '', cwd: str = ''):
-        changed = index != self.current or detail != self.details[index]
-        self.current, self.command, self.cwd = index, redact(command), cwd
-        self.states[index], self.details[index] = 'running', detail
-        if self.enabled and changed:
-            self.lines.clear()
-            self.partial = ''
-            self.carriage = False
-        self.refresh()
+        with self.lock:
+            log = self.outputs[index]
+            if log.command and (detail != self.details[index] or cwd != log.cwd):
+                if log.partial:
+                    log.lines.append(log.partial)
+                    log.partial = ''
+                log.lines.append('── ' + detail + ' ──')
+            self.current = index
+            log.command, log.cwd = safe_text(command), cwd
+            self.states[index], self.details[index] = 'running', detail
+            if self.follow:
+                self.selected = index
+                log.offset = 0
 
     def finish(self, index: int, state: str = 'done', detail: str = ''):
-        self.states[index] = state
-        if detail:
-            self.details[index] = detail
-        self.refresh()
+        with self.lock:
+            self.states[index] = state
+            if detail:
+                self.details[index] = detail
 
     def feed(self, text: str):
-        key = os.environ.get('DNSDUMPSTER_API_KEY')
-        if key:
-            text = text.replace(key, '[REDACTED]')
-        text = redact(text)
-        for char in text:
-            if char == '\n':
-                self.lines.append(self.partial)
-                self.partial = ''
-                self.carriage = False
-            elif char == '\r':
-                self.carriage = True
-            elif char not in ('\x00', '\x07'):
-                if self.carriage:
-                    self.partial = ''
-                    self.carriage = False
-                self.partial = (self.partial + char)[-16384:]
+        # Child terminal controls never reach the outer terminal. Keep only SGR
+        # colors; strip cursor movement, title/clipboard strings and other C0s.
+        with self.lock:
+            log = self.outputs[self.current]
+            for char in text:
+                if log.ansi == 'escape':
+                    log.escape = ''
+                    log.ansi = 'csi' if char == '[' else 'string' if char in ']P^_' else ''
+                elif log.ansi == 'csi':
+                    if '@' <= char <= '~':
+                        if char == 'm' and re.fullmatch(r'[0-9;:]*', log.escape):
+                            log.partial += '\x1b[' + log.escape + 'm'
+                        log.ansi = log.escape = ''
+                    elif len(log.escape) < 128:
+                        log.escape += char
+                    else:
+                        log.ansi = log.escape = ''
+                elif log.ansi == 'string':
+                    if char == '\x07':
+                        log.ansi = ''
+                    elif char == '\x1b':
+                        log.ansi = 'string-escape'
+                elif log.ansi == 'string-escape':
+                    log.ansi = '' if char == '\\' else 'string'
+                elif char == '\x1b':
+                    log.ansi = 'escape'
+                elif char == '\n':
+                    log.lines.append(safe_text(log.partial))
+                    log.partial, log.carriage = '', False
+                elif char == '\r':
+                    log.carriage = True
+                elif char.isprintable() or char == '\t':
+                    if log.carriage:
+                        log.partial, log.carriage = '', False
+                    log.partial = (log.partial + char)[-16384:]
 
     def refresh(self):
-        if self.live:
-            self.live.update(self.render(), refresh=True)
+        # Live owns the only render timer. Output volume cannot trigger an
+        # unbounded redraw loop or compete with the keyboard/reader threads.
+        return
+
+    def _start_input(self):
+        if os.name != 'posix':
+            return
+        try:
+            fd = sys.stdin.fileno()
+            if not os.isatty(fd):
+                return
+            original = termios.tcgetattr(fd)
+            tty.setcbreak(fd, termios.TCSANOW)
+        except (OSError, ValueError, termios.error):
+            return
+        self._input_fd, self._original_tty = fd, original
+        self._keys = b''
+        self._stop_keyboard = threading.Event()
+        self._keyboard = threading.Thread(target=self._read_keys, name='osint-keyboard', daemon=True)
+        try:
+            self._keyboard.start()
+        except BaseException:
+            self._stop_input()
+            raise
+
+    def _stop_input(self):
+        self._stop_keyboard.set()
+        try:
+            if self._keyboard and self._keyboard is not threading.current_thread():
+                self._keyboard.join(timeout=1)
+        finally:
+            if self._input_fd is not None and self._original_tty is not None:
+                try:
+                    termios.tcsetattr(self._input_fd, termios.TCSANOW, self._original_tty)
+                except (OSError, termios.error):
+                    pass
+            self._input_fd = self._original_tty = self._keyboard = None
+            with self.lock:
+                self.input_mode = False
+
+    def _read_keys(self):
+        while not self._stop_keyboard.is_set():
+            try:
+                ready, _, _ = select.select([self._input_fd], [], [], 0.05)
+                if ready:
+                    data = os.read(self._input_fd, 1024)
+                    if not data:
+                        break
+                    self.consume_keys(data)
+            except (OSError, ValueError):
+                break
+
+    def handle_key(self, key: str):
+        with self.lock:
+            if key == 'up':
+                self.selected = max(0, self.selected - 1)
+                self.follow = False
+            elif key == 'down':
+                self.selected = min(len(self.labels) - 1, self.selected + 1)
+                self.follow = False
+            elif key == 'pageup':
+                self.outputs[self.selected].offset += self.page_size
+                self.follow = False
+            elif key == 'pagedown':
+                log = self.outputs[self.selected]
+                log.offset = max(0, log.offset - self.page_size)
+                self.follow = False
+            elif key == 'follow':
+                self.follow = True
+                self.selected = self.current
+                self.outputs[self.selected].offset = 0
+            elif key == 'tab':
+                self.input_mode = not self.input_mode if self._child_input is not None else False
+                if self.input_mode:
+                    self.follow = True
+                    self.selected = self.current
+                    self.outputs[self.selected].offset = 0
+
+    def consume_keys(self, data: bytes):
+        keys = {b'\x1b[A': 'up', b'\x1bOA': 'up', b'\x1b[B': 'down', b'\x1bOB': 'down',
+                b'\x1b[5~': 'pageup', b'\x1b[6~': 'pagedown'}
+        with self.lock:
+            self._keys += data
+            while self._keys:
+                if self.input_mode:
+                    before, tab, after = self._keys.partition(b'\t')
+                    if self._child_input is not None:
+                        room = max(0, 65536 - len(self._pending_input))
+                        self._pending_input.extend(before[:room])
+                    self._keys = after if tab else b''
+                    if tab:
+                        self.handle_key('tab')
+                    continue
+                matched = next((sequence for sequence in keys if self._keys.startswith(sequence)), None)
+                if matched:
+                    self.handle_key(keys[matched])
+                    self._keys = self._keys[len(matched):]
+                elif any(sequence.startswith(self._keys) for sequence in keys):
+                    break  # tmux/SSH may split an escape sequence across reads.
+                else:
+                    key, self._keys = self._keys[:1], self._keys[1:]
+                    if key in (b'f', b'F'):
+                        self.handle_key('follow')
+                    elif key == b'\t':
+                        self.handle_key('tab')
+
+    def attach_input(self, fd: int):
+        with self.lock:
+            self._child_input = fd
+            self._pending_input.clear()
+            self.input_mode = False
+
+    def detach_input(self, fd: int):
+        with self.lock:
+            if self._child_input == fd:
+                self._child_input = None
+                self._pending_input.clear()
+                self.input_mode = False
+
+    def input_pending(self) -> bool:
+        with self.lock:
+            return bool(self._pending_input)
+
+    def flush_input(self, fd: int):
+        with self.lock:
+            if self._child_input != fd or not self._pending_input:
+                return
+            try:
+                count = os.write(fd, self._pending_input)
+                del self._pending_input[:count]
+            except BlockingIOError:
+                pass
+            except OSError:
+                self._pending_input.clear()
 
     @contextmanager
     def native_terminal(self):
-        """Let sudo/system installers own their normal password dialogs."""
         if self.live:
+            self._stop_input()
             self.live.stop()
             print(self.labels[self.current] + ': follow the system installer prompts', flush=True)
         try:
@@ -383,81 +609,145 @@ class TaskScreen:
         finally:
             if self.live:
                 self.live.start(refresh=True)
+                self._start_input()
 
     def render(self):
-        height = self.console.size.height
-        root = self.Layout()
-        root.split_column(self.Layout(name='header', size=3), self.Layout(name='body'), self.Layout(name='footer', size=1))
+        # Snapshot under one lock. Rendering never holds it while using Console.
+        with self.lock:
+            selected, current = self.selected, self.current
+            states, details = self.states[:], self.details[:]
+            log = self.outputs[selected]
+            command, cwd = log.command, log.cwd
+            output = list(log.lines) + ([safe_text(log.partial)] if log.partial else [])
+            offset, following, input_mode = log.offset, self.follow, self.input_mode
+        width, height = self.console.size
+        left_width = min(48, max(30, width // 3 + 2))
+        content_width = max(1, width - left_width - 4)
+        body_height = max(1, height - 4)
+        content_height = max(1, body_height - 2)
+        metadata = self.Text(self.labels[selected] + '\n', style='bold cyan')
+        if details[selected]:
+            metadata.append(details[selected] + '\n', style='')
+        if cwd:
+            metadata.append('cwd: ' + cwd + '\n', style='dim')
+        if command:
+            metadata.append('$ ' + command, style='dim')
+        metadata_lines = list(metadata.wrap(self.console, content_width))[:min(6, max(1, content_height // 2))]
+        remaining = max(1, content_height - len(metadata_lines) - 1)
+        rendered_output = self.Text.from_ansi('\n'.join(safe_text(line) for line in output))
+        wrapped = list(rendered_output.wrap(self.console, content_width)) if output else [self.Text('No output yet', style='dim')]
+        offset = min(offset, max(0, len(wrapped) - remaining))
+        end = len(wrapped) - offset
+        tail = wrapped[max(0, end - remaining):end]
+        with self.lock:
+            self.page_size = remaining
+            self.outputs[selected].offset = offset
+        body = self.Text('\n').join(metadata_lines + [self.Text('─' * content_width, style='dim')] + tail)
+        root = self.Layout(size=height)
+        root.split_column(self.Layout(name='header', size=3), self.Layout(name='body', size=body_height), self.Layout(name='footer', size=1))
         elapsed = int(time.monotonic() - self.started)
-        root['header'].update(self.Panel(self.Text(f'{self.title} | elapsed {elapsed // 60:02d}:{elapsed % 60:02d}', style='bold cyan')))
-        root['body'].split_row(self.Layout(name='tasks', size=min(48, max(32, self.console.size.width // 3 + 2))), self.Layout(name='terminal'))
+        mode = 'TOOL INPUT' if input_mode else 'follow' if following else 'history'
+        root['header'].update(self.Panel(self.Text(f'{self.title} | {elapsed // 60:02d}:{elapsed % 60:02d} | {mode}', style='bold cyan')))
+        root['body'].split_row(self.Layout(name='tasks', size=left_width), self.Layout(name='terminal'))
         table = self.Table.grid(padding=(0, 1), expand=True)
         table.add_column(width=2)
         table.add_column(ratio=1)
-        table.add_column(width=12)
-        visible = max(3, height - 8)
-        start = max(0, min(self.current - visible // 2, len(self.labels) - visible))
+        table.add_column(width=11)
+        visible = max(1, content_height)
+        start = max(0, min(selected - visible // 2, len(self.labels) - visible))
         colors = {'running': 'cyan', 'done': 'green', 'installed': 'green', 'present': 'green',
                   'cached': 'blue', 'failed': 'red', 'interrupted': 'yellow', 'planned': 'yellow'}
         for i in range(start, min(len(self.labels), start + visible)):
-            state = self.states[i]
-            style = colors.get(state, 'dim')
-            table.add_row(self.Text('>' if i == self.current else '', style='cyan'),
-                          self.Text(self.labels[i].split(': ', 1)[-1], style=style, overflow='ellipsis', no_wrap=True),
-                          self.Text(state, style=style))
+            style = colors.get(states[i], 'dim')
+            marker = ('>' if i == selected else ' ') + ('*' if i == current and states[i] == 'running' else ' ')
+            table.add_row(self.Text(marker, style='cyan'), self.Text(self.labels[i].split(': ', 1)[-1], style=style, overflow='ellipsis', no_wrap=True), self.Text(states[i], style=style))
         root['tasks'].update(self.Panel(table, title='Tasks'))
-        metadata = self.Text()
-        metadata.append(self.labels[self.current] + '\n', style='bold cyan')
-        if self.details[self.current]:
-            metadata.append(self.details[self.current] + '\n')
-        if self.cwd:
-            metadata.append('cwd: ' + self.cwd + '\n', style='dim')
-        if self.command:
-            metadata.append('$ ' + self.command + '\n', style='dim')
-        # Keep room for live output even for long shell pipelines.
-        width = max(35, self.console.size.width - min(48, max(32, self.console.size.width // 3 + 2)) - 4)
-        metadata_lines = metadata.wrap(self.console, width)[:6]
-        body = self.Text('\n').join(metadata_lines)
-        body.append('\n' + '─' * min(width, 70) + '\n', style='dim')
-        remaining = max(1, height - len(metadata_lines) - 9)
-        output = list(self.lines) + ([self.partial] if self.partial else [])
-        tail = self.Text.from_ansi('\n'.join(output[-remaining:])) if output else self.Text('Waiting for command output…', style='dim')
-        body.append_text(tail)
-        root['terminal'].update(self.Panel(body, title='Live terminal'))
-        root['footer'].update(self.Text('Ctrl+C: stop | Task list follows the current command | --ui plain: text log', style='dim'))
+        root['terminal'].update(self.Panel(body, title='Live terminal' if selected == current and not offset else 'Task history'))
+        hint = 'TOOL INPUT | Tab: tasks | Ctrl+C: stop' if input_mode else '↑/↓: tasks | PgUp/PgDn: scroll | f: follow | Tab: tool input | Ctrl+C: stop'
+        root['footer'].update(self.Text(hint, style='dim', no_wrap=True, overflow='ellipsis'))
         return root
+
+
+def safe_text(text: str) -> str:
+    key = os.environ.get('DNSDUMPSTER_API_KEY')
+    return redact(text.replace(key, '[REDACTED]') if key else text)
+
+
+def resize_child_terminal(master: int, source: int, child=None):
+    try:
+        size = os.get_terminal_size(source)
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', size.lines, size.columns, 0, 0))
+        if child is not None and child.poll() is None:
+            os.killpg(child.pid, signal.SIGWINCH)
+        return size
+    except (OSError, ValueError):
+        return None
 
 
 def run_process(argv: list[str], workspace: Path, screen: TaskScreen | None = None, env: dict | None = None, own_session: bool = True) -> None:
     env = dict(os.environ if env is None else env, PWD=str(workspace))
     interrupted = False
+    capture = bool(screen and screen.enabled)
+    use_pty = capture and own_session and screen._input_fd is not None
+    master = slave = child = None
 
     def defer_interrupt(signum, frame):
         nonlocal interrupted
         interrupted = True
 
-    # Own the child before delivering Ctrl+C; otherwise interruption inside
-    # Popen can leave a running command without a Python process handle.
     previous = signal.signal(signal.SIGINT, defer_interrupt)
     try:
+        if use_pty:
+            master, slave = os.openpty()
+            os.set_blocking(master, False)
+            resize_child_terminal(master, screen._input_fd)
         child = subprocess.Popen(argv, cwd=workspace, env=env, start_new_session=own_session,
-                                 stdout=subprocess.PIPE if screen and screen.enabled else None,
-                                 stderr=subprocess.STDOUT if screen and screen.enabled else None)
+                                 stdin=slave if use_pty else None,
+                                 stdout=slave if use_pty else subprocess.PIPE if capture else None,
+                                 stderr=slave if use_pty else subprocess.STDOUT if capture else None)
+    except BaseException:
+        if master is not None:
+            os.close(master)
+        raise
     finally:
+        if slave is not None:
+            os.close(slave)
         signal.signal(signal.SIGINT, previous)
     try:
+        if use_pty:
+            screen.attach_input(master)
         if interrupted:
             raise KeyboardInterrupt
-        if screen and screen.enabled:
+        if capture:
             decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+            fd = master if use_pty else child.stdout.fileno()
+            last_size = os.get_terminal_size(screen._input_fd) if use_pty else None
             while True:
-                ready, _, _ = select.select([child.stdout], [], [], 0.1)
+                writes = [master] if use_pty and screen.input_pending() else []
+                ready, writable, _ = select.select([fd], writes, [], 0.05)
+                if writable:
+                    screen.flush_input(master)
                 if ready:
-                    chunk = os.read(child.stdout.fileno(), 4096)
+                    try:
+                        chunk = os.read(fd, 16384)
+                    except BlockingIOError:
+                        continue
+                    except OSError as error:
+                        if use_pty and error.errno == errno.EIO:
+                            chunk = b''  # Linux PTYs report EIO at EOF.
+                        else:
+                            raise
                     if not chunk:
                         break
                     screen.feed(decoder.decode(chunk))
-                screen.refresh()
+                if use_pty:
+                    try:
+                        size = os.get_terminal_size(screen._input_fd)
+                        if size != last_size:
+                            resize_child_terminal(master, screen._input_fd, child)
+                            last_size = size
+                    except OSError:
+                        pass
                 if child.poll() is not None and not ready:
                     break
             screen.feed(decoder.decode(b'', final=True))
@@ -477,7 +767,6 @@ def run_process(argv: list[str], workspace: Path, screen: TaskScreen | None = No
                 break
             except subprocess.TimeoutExpired:
                 continue
-        # The shell may exit before descendants that ignored SIGINT.
         if own_session:
             try:
                 os.killpg(child.pid, signal.SIGKILL)
@@ -486,6 +775,9 @@ def run_process(argv: list[str], workspace: Path, screen: TaskScreen | None = No
         child.wait()
         raise
     finally:
+        if master is not None:
+            screen.detach_input(master)
+            os.close(master)
         if child.stdout:
             child.stdout.close()
     if code:
@@ -841,7 +1133,11 @@ class Collector:
         resolver = Path.home() / 'selflists/dns/resolvers.txt'
         if phase == 'active':
             inputs['resolvers.txt'] = file_hash(resolver) if resolver.is_file() else None
-        definition = fingerprint([root, [step.command for step in self.steps[phase]], inputs])
+        # -y changes only BBOT's start confirmation. Reuse previous completed
+        # steps when upgrading from commands without this trailing flag.
+        commands = [step.command.removesuffix(' -y') if step.title.startswith('BBOT ') else step.command
+                    for step in self.steps[phase]]
+        definition = fingerprint([root, commands, inputs])
         key = root + ':' + phase
         old = self.jobs.get(key)
         if not self.args.refresh and old and old['definition'] == definition:
