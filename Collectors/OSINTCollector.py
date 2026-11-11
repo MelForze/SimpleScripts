@@ -6,9 +6,10 @@ import argparse
 import codecs
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
 import hashlib
+import heapq
 import errno
 import json
 import os
@@ -55,6 +56,8 @@ STATE_FILE = '.osint/template-state.json'
 HISTORY_FILE = 'findings_history.json'
 DNS_ROUNDS = 2
 COLLECTION_WORKERS = 4
+EXPORT_CHUNK_BYTES = 16 * 1024 * 1024
+EXPORT_MERGE_FILES = 32
 RESOLVER_FILES = ('resolvers.txt', 'resolvers-trusted.txt')
 SEEDS_COMMAND = r'''for file in ./subdomains/subdomains_{dnsdumpster,crtsh,subfinder,findomain,assetfinder,bbot_passive}.txt; do if [ -f "$file" ]; then cat "$file"; fi; done | awk 'NR==FNR {root=tolower($1); sub(/\.$/,"",root); if(root!=""){roots[root]=1; print root}; next} {name=tolower($1); sub(/^\*\./,"",name); sub(/\.$/,"",name); if(name !~ /^[a-z0-9.-]+$/) next; for(root in roots) if(name==root || (length(name)>length(root) && substr(name,length(name)-length(root))=="."root)){print name; break}}' top_domains.txt - | sort -u > bbot_seeds.txt'''
 _execution = threading.local()
@@ -77,18 +80,90 @@ def file_hash(path: Path) -> str:
 
 
 def atomic_text(path: Path, value: str) -> None:
+    atomic_chunks(path, (value,))
+
+
+def atomic_chunks(path: Path, chunks) -> None:
+    """Publish streamed text only after the entire temporary file is durable."""
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
                                          prefix='.' + path.name, delete=False) as handle:
             temporary = Path(handle.name)
-            handle.write(value)
+            handle.writelines(chunks)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
         if temporary:
             temporary.unlink(missing_ok=True)
+
+
+def unique_lines(values):
+    previous = None
+    for value in values:
+        if value != previous:
+            yield value + '\n'
+            previous = value
+
+
+def merge_sorted_files(sources, target: Path) -> None:
+    with ExitStack() as stack:
+        streams = [stack.enter_context(path.open(encoding='utf-8')) for path in sources]
+        # Compare the values without their stored newline: a prefix must sort
+        # before its extension even when that extension begins with a tab.
+        values = heapq.merge(*((line[:-1] for line in stream) for stream in streams))
+        atomic_chunks(target, unique_lines(values))
+
+
+def export_text_files(sources, target: Path) -> None:
+    """Sort/deduplicate arbitrary-size provider files using bounded chunks."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.osint-export-', dir=target.parent) as scratch:
+        scratch = Path(scratch)
+        runs, chunk = [], []
+        size = 0
+        sequence = 0
+
+        def flush():
+            nonlocal sequence, size
+            path = scratch / str(sequence)
+            sequence += 1
+            chunk.sort()
+            with path.open('w', encoding='utf-8') as handle:
+                handle.writelines(unique_lines(chunk))
+            runs.append(path)
+            chunk.clear()
+            size = 0
+
+        for source in sources:
+            with source.open(encoding='utf-8') as handle:
+                for raw in handle:
+                    # Match read_text().splitlines(), including Unicode line
+                    # separators, without retaining the whole source file.
+                    for value in raw.splitlines():
+                        if value.strip():
+                            chunk.append(value)
+                            # Account for strings, list pointers and sort scratch
+                            # space. One unusually long input line may exceed this.
+                            size += sys.getsizeof(value) + 16
+                            if size >= EXPORT_CHUNK_BYTES:
+                                flush()
+        if chunk:
+            flush()
+        # Limit both open files and the merge heap, even for very large inputs.
+        while len(runs) > EXPORT_MERGE_FILES:
+            next_runs = []
+            for start in range(0, len(runs), EXPORT_MERGE_FILES):
+                group = runs[start:start + EXPORT_MERGE_FILES]
+                path = scratch / str(sequence)
+                sequence += 1
+                merge_sorted_files(group, path)
+                next_runs.append(path)
+                for source in group:
+                    source.unlink()
+            runs = next_runs
+        merge_sorted_files(runs, target)
 
 
 @contextmanager
@@ -1895,7 +1970,7 @@ class Collector:
 
     def export(self):
         # Aggregate copies; original per-root command outputs remain untouched.
-        merged = {}
+        sources = {}
         for root in self.roots:
             for phase in ('passive', 'active'):
                 job = self.jobs.get(root + ':' + phase)
@@ -1916,16 +1991,17 @@ class Collector:
                         if name == 'ptr_ips.txt':
                             continue
                     if path.is_file():
-                        merged.setdefault(name, set()).update(path.read_text(encoding='utf-8').splitlines())
-        for name, values in merged.items():
-            target = self.output / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_text(target, ''.join(line + '\n' for line in sorted(values) if line.strip()))
-        exports = set(merged) | {'top_domains.txt'}
+                        sources.setdefault(name, []).append(path)
+        for number, (name, paths) in enumerate(sorted(sources.items()), 1):
+            self.message(f'Export ({number}/{len(sources)}): {name}')
+            export_text_files(paths, self.output / name)
+        exports = set(sources) | {'top_domains.txt'}
         # Passive-only runs still expose their collected names without inventing
         # a final domain-collection command absent from the passive template.
-        if 'domains.txt' in merged:
-            atomic_text(self.output / 'domains_new.txt', ''.join(line + '\n' for line in sorted(merged['domains.txt'] - self.before_domains)))
+        if 'domains.txt' in sources:
+            with (self.output / 'domains.txt').open(encoding='utf-8') as handle:
+                atomic_chunks(self.output / 'domains_new.txt',
+                              (line for line in handle if line[:-1] not in self.before_domains))
             exports.add('domains_new.txt')
         # Removing a root must not leave its old aggregate files visible when
         # the new scope has no completed active results yet.

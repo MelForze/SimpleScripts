@@ -381,6 +381,13 @@ directory. An input already named `top_domains.txt` in that directory is kept
 verbatim. `domains_new.txt` contains names newly added to the final export by
 this invocation; passive-only runs do not invent a final collection stage.
 Export copies are deduplicated; per-command output files are untouched.
+Large exports (including raw MassDNS files) are sorted in approximately 16 MiB
+chunks and merged through temporary files beside the destination, with at most
+32 input chunks open at once. Allow extra disk space for sorting; each completed
+file replaces its destination atomically. Export progress lists the current file.
+Sorting no longer retains all raw results in RAM; scoped finding history still
+uses memory proportional to the number of discovered names. If export fails,
+repeat the same command without `--refresh` to reuse valid scan checkpoints.
 
 `findings_history.json` retains scoped findings across successful runs, with
 source attribution, roots, first/last observation times and per-source status:
@@ -391,8 +398,8 @@ dates. Legacy checkpoints without dates import with null observation times.
 Failed/interrupted runs leave the previous history intact; successfully saved
 checkpoints can contribute their original observation dates after resuming.
 Historical names are not automatically put back into current scan targets.
-This upgrade changes active commands, so previous active checkpoints are
-recollected once; unchanged passive checkpoints remain reusable.
+Checkpoints are reusable while their command definitions, inputs and recorded
+outputs remain valid. Export-only updates do not invalidate completed scans.
 
 The built-in commands use `-n bbot_active` / `-n bbot_passive` and their matching copy
 paths. PureDNS retains its three top-level output files; a following explicit
