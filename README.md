@@ -138,6 +138,58 @@ export DNSDUMPSTER_API_KEY="YOUR_API_KEY"
 OSINTCollector.py -i top_domains.txt
 ```
 
+Install missing external tools first, from any working directory:
+
+```bash
+OSINTCollector.py --install-tools --dry-run
+OSINTCollector.py --install-tools
+```
+
+`--install-tools` is an installation-only mode and does not need `-i`. It exits
+without starting collection; pass `--mode passive` or `--mode active` to install
+only that part's prerequisites. Ordinary collection never installs packages.
+Existing executables are reused. Installation supports macOS with Homebrew,
+Debian/Ubuntu/Kali with apt, Fedora with dnf, and Arch/Manjaro with pacman, on
+x86_64 and ARM64. Unsupported systems/architectures stop with a clear message.
+Native Windows must use a supported WSL environment. Homebrew itself must
+already be installed. Linux system packages may require sudo. Commands using sudo and native
+Docker Desktop installation temporarily use the normal terminal for system
+prompts; the dashboard resumes afterward. Passwords are handled by sudo/system
+installers and are never captured by the collector.
+
+Subfinder, Assetfinder, dnsx and PureDNS are installed from their upstream Go
+modules into `~/.local/bin`. Existing Go >= 1.21 is reused with automatic
+upstream toolchain selection; otherwise a matching stable Go SDK is downloaded
+from go.dev, checked against the published SHA-256, and installed under
+`~/.local/share/simplescripts/toolchains/`. System Go is not replaced. macOS
+uses Homebrew for Findomain and massdns; Linux uses the official Findomain
+release for its CPU architecture and builds massdns from upstream source.
+The collector adds these tool directories to its own process PATH without
+editing shell profiles. Use `~/.local/bin` in your shell PATH if you also want
+to invoke the newly installed binaries directly.
+
+Docker is installed through the platform package manager (Docker Desktop on
+macOS, distro Docker/Moby packages on Linux). WSL instead asks for Docker
+Desktop integration, avoiding installation of another engine. A final check
+requires a responding Docker server available to the current user; start the
+engine/Desktop or configure access if that check fails, then repeat the flag.
+The installer does not change Docker groups, socket permissions, API keys,
+provider configs, resolver files or wordlists. These still need your own data.
+`--install-tools --dry-run` performs no downloads, subprocess execution or writes.
+
+On an interactive terminal with Rich and enough room, both installation and
+collection show a two-column dashboard: task states on the left; current root,
+command, working directory and live stdout/stderr on the right. The task list
+follows the current command. Recent output is bounded to 300 lines in memory.
+Color and carriage-return progress output are supported. Tool prompts retain
+stdin, including Docker BBOT's `-it`. Ctrl+C terminates the owned process group
+and restores the terminal; already completed collection stages stay saved.
+Use `--ui plain` for a normal text log, or `--ui dashboard` to explicitly require
+the dashboard. Auto mode falls back to plain logs for redirected output, small
+terminals, or when Rich is unavailable. Rich is already a project dependency
+for normal pipx installations. The screen changes presentation only; collection
+commands, their ordering and per-root workspaces stay as before.
+
 Results default to the current launch directory; `-o` selects another result
 directory. The default is `--mode all`: passive collection first, then active collection.
 `--mode passive` and `--mode active` select one part. Domain-list command variants
@@ -199,8 +251,8 @@ reused because its commands differed. Old data is not deleted.
 
 `--dry-run` prints a read-only plan without running tools or creating/modifying
 project files. API keys are redacted in progress/plans; the actual command is
-executed with environment-variable expansion by Bash. Live tool output goes to the terminal, preserving BBOT's
-interactive operation. A nonzero shell exit or a missing expected output stops
+executed with environment-variable expansion by Bash. Live tool output is shown in the terminal panel or plain log, preserving BBOT's
+interactive stdin. A nonzero shell exit or a missing expected output stops
 the run (exit 1); Ctrl+C returns 130 and preserves completed checkpoints.
 Pipeline exit semantics remain Bash defaults, as in the agreed commands: an
 upstream failure can be masked by a successful final pipeline command.
